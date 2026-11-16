@@ -1,0 +1,3617 @@
+# -*- coding: utf-8 -*-
+"""
+Antigravity 一键汉化 v1.15（Windows / macOS 双平台）
+================================================
+用法：
+  python localize.py            # 交互菜单
+  python localize.py apply      # 直接汉化
+  python localize.py restore    # 恢复官方英文原版
+  python localize.py status     # 查看状态
+  python localize.py chinese-output   # AI 回复中文化（写入全局规则）
+  python localize.py update           # 检查更新（查 GitHub Release，只下载不替换）
+  可选：--path <安装目录>  --yes（免确认）
+
+流程：杀进程 → 备份 → 解包 → 注入 → 语法门禁 → 打包 → 部署后复检 → 原子替换
+      →（macOS 追加）代码签名重签 → 启动
+安全：汉化 / 还原 / 状态 / AI 中文化全程仅本地操作，无任何网络行为；唯一例外是
+      「检查更新」，只有你主动点它才会连一次 GitHub（只查版本号，不自动替换）。
+      所有修改幂等可重入；备份永不降级。
+
+跨平台说明：
+  本脚本为 Windows / macOS 双平台共用，按当前系统自动走对应分支。
+  macOS 与 Windows 的三处关键差异已内置处理：
+    1. 安装路径：/Applications/Antigravity.app/Contents/Resources
+    2. 进程管理：按完整可执行路径精确匹配，绝不误杀同名进程
+    3. 代码签名：改 asar 会使 Apple 签名失效，必须重签，否则 App 打不开
+       （Apple Silicon 上直接启动失败）。重签采用 Apple 推荐的分层方式：
+       嵌套组件裸签 → 主包带 entitlements 签。
+       主包额外用 -r 写入稳定的代码身份（只锚定签名标识），否则 ad-hoc
+       默认身份锚定在二进制哈希上，Squirrel 会拒绝官方应用内更新。
+       写入失败自动回退普通重签；全程需管理员密码。
+"""
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+import urllib.error
+import urllib.request
+
+# 控制台编码自适应：Windows 中文版默认代码页 936(GBK)，无法表示部分符号
+# （如 ✗ ⚠），若不处理会显示成问号或触发 UnicodeEncodeError。
+# 策略：优先用 UTF-8 输出（Windows 10 起支持良好）；若终端明确是 GBK，
+# 则把不可表示的符号降级为等价的 ASCII/中文写法，确保任何环境下都不乱码。
+def _console_supports(ch):
+    enc = (getattr(sys.stdout, "encoding", None) or "utf-8").lower()
+    try:
+        ch.encode(enc)
+        return True
+    except (UnicodeEncodeError, LookupError):
+        return False
+
+
+_GLYPH = {
+    # 降级值为纯 ASCII 且不含方括号，避免与外层 [tag] 叠加成 [[OK]]
+    "✓": "v",   # ✓ 对勾 → v（checkmark 近似）
+    "✗": "x",        # ✗ 叉号 → x
+    "△": "!",        # △ 三角 → !
+    "·": "-",          # · 间隔号 → -
+    "→": "->",         # → 箭头 → ->
+    "⚠": "!",        # ⚠ 警告 → !
+    "★": "*",          # ★ 星 → *
+}
+
+
+def _fit_glyphs(text):
+    """把文本里当前终端无法表示的符号替换为等价写法。
+    替换值已是纯 ASCII，因此不会出现重复括号。"""
+    out = text
+    for ch, alt in _GLYPH.items():
+        if ch in out and not _console_supports(ch):
+            out = out.replace(ch, alt)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 注意：不要在这里给 stdout 改 encoding。改动前先读完这段。
+#
+# 曾经尝试过"把 stdout 编码对齐到控制台代码页(cp936)"，结果反而制造了乱码，已回滚。
+# 原因：Windows 上 Python 3.6+ 的控制台输出走 _WindowsConsoleIO，内部链路是
+#     文本 → encode(utf-8) → 字节 → decode(utf-8) → WriteConsoleW(宽字符)
+# 也就是说中文能不能正常显示，跟控制台代码页 936 没有关系，靠的是这套宽字符链路。
+#
+# 一旦把 encoding 改成 cp936，TextIOWrapper 吐出的就是 GBK 字节，
+# _WindowsConsoleIO 仍然按 UTF-8 去解，解出来全是方块——比不改更糟。
+# 实测症状：bat 自己 echo 的中文正常，Python 打出来的菜单全是"□□□"。
+#
+# 结论：不要动 encoding。只允许加 errors="replace"，避免极端字符把程序打崩。
+# ---------------------------------------------------------------------------
+try:
+    sys.stdout.reconfigure(errors="replace")
+    sys.stderr.reconfigure(errors="replace")
+except Exception:
+    pass
+
+# ----------------------------------------------------------------------------
+# 常量
+# ----------------------------------------------------------------------------
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ENGINE_PATH = os.path.join(SCRIPT_DIR, "engine.js")
+DATA_PATH = os.path.join(SCRIPT_DIR, "zh_data.json")
+
+ENGINE_START = "// ===== [AGY_ZH_ENGINE_START] Antigravity 一键汉化引擎（整合增强版）====="
+ENGINE_END = "// ===== [AGY_ZH_ENGINE_END] ====="
+MENU_START = "// ===== [AGY_ZH_MENU_START] 原生菜单翻译 ====="
+MENU_END = "// ===== [AGY_ZH_MENU_END] ====="
+TRAY_START = "// ===== [AGY_ZH_TRAY_START] 托盘菜单翻译 ====="
+TRAY_END = "// ===== [AGY_ZH_TRAY_END] ====="
+CTX_START = "// ===== [AGY_ZH_CTXMENU_START] 原生右键菜单翻译 ====="
+CTX_END = "// ===== [AGY_ZH_CTXMENU_END] ====="
+IDE_START = "// ===== [AGY_ZH_IDE_START] Antigravity IDE 右侧面板翻译 ====="
+IDE_END = "// ===== [AGY_ZH_IDE_END] ====="
+IDE_HOOK_NAME = "agy-zh-ide.mjs"
+
+TOOL_VERSION = "v1.15"               # 工具版本号（唯一数据源，改这里即可全局生效）
+TESTED_VERSION = "2.31.2"          # 深度适配验证过的版本（Windows 真机实测：2.21.1 / 2.23.1 / 2.24.0 / 2.25.0 / 2.27.0 / 2.28.1 / 2.28.2 / 2.31.0 / 2.31.2）
+EXIT_CANCELLED = 130                # 用户主动中断（Ctrl+C / 输入流断开）。批处理据此区分"取消"和"出错"
+MARKER_CHECK = b"AGY_ZH_ENGINE_START"   # 用于字节级判断 asar 是否已被汉化
+
+# --- 检查更新（全程序唯一的联网入口，仅当用户主动点「检查更新」才会触发）---
+UPDATE_REPO = "QingniaoDawn/Antigravity-YiJianHanHua"
+UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+UPDATE_PAGE = f"https://github.com/{UPDATE_REPO}/releases/latest"
+UPDATE_TIMEOUT = 6          # 查版本号的超时（秒）：查不到就当没更新，绝不能卡住用户
+DOWNLOAD_TIMEOUT = 30       # 下载时单块读取超时（秒）
+DL_CHUNK = 65536            # 下载分块大小
+
+IS_MAC = sys.platform == "darwin"
+IS_WIN = sys.platform == "win32"
+IS_LINUX = sys.platform.startswith("linux")
+
+LINUX_PATHS = [
+    "/opt/antigravity/resources",
+    "/opt/Antigravity/resources",
+    "/usr/lib/antigravity/resources",
+    "/usr/share/antigravity/resources",
+    os.path.expanduser("~/.local/share/antigravity/resources"),
+    os.path.expanduser("~/.local/opt/antigravity/resources"),
+]
+
+WIN_PATHS = [
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "antigravity") if os.environ.get("LOCALAPPDATA") else "",
+    os.path.join(os.environ.get("ProgramFiles", ""), "Antigravity") if os.environ.get("ProgramFiles") else "",
+    os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Antigravity") if os.environ.get("ProgramFiles(x86)") else "",
+]
+# macOS：.app 包结构。Contents/Resources 下才有 app.asar（Electron 官方标准布局）。
+# 除标准位置外，还要覆盖 macOS 上真实存在的几种安装方式：
+#   - ~/Applications：用户自装
+#   - ~/Downloads / ~/Desktop：直接从 dmg 或浏览器下载后未拖入"应用程序"
+#   - /Volumes/*：dmg 挂载后直接运行（未安装）
+#   - /opt/homebrew/Caskroom、/usr/local/Caskroom：Homebrew cask 安装
+MAC_PATHS = [
+    "/Applications/Antigravity.app/Contents/Resources",
+    os.path.expanduser("~/Applications/Antigravity.app/Contents/Resources"),
+    os.path.expanduser("~/Downloads/Antigravity.app/Contents/Resources"),
+    os.path.expanduser("~/Desktop/Antigravity.app/Contents/Resources"),
+]
+# 需要在运行时展开通配的路径（dmg 挂载点、Homebrew 等）
+MAC_PATTERNS = [
+    "/Volumes/*/Antigravity.app/Contents/Resources",
+    "/opt/homebrew/Caskroom/antigravity/*/Antigravity.app/Contents/Resources",
+    "/usr/local/Caskroom/antigravity/*/Antigravity.app/Contents/Resources",
+    "/Applications/*.app/Contents/Resources",       # 应用名大小写/变体
+]
+
+PROC_NAMES = ["Antigravity.exe", "language_server.exe"]
+
+
+def log(msg, ok=False, warn=False):
+    """统一日志出口。图标按终端编码能力自适应：
+    UTF-8 终端显示 ✓ ·，GBK 等旧终端自动降级为纯 ASCII，任何环境都不乱码。"""
+    if ok:
+        tag = _fit_glyphs("[✓]")
+    elif warn:
+        tag = "[!]"
+    else:
+        tag = _fit_glyphs("[·]")
+    print(_fit_glyphs(f"{tag} {msg}"), flush=True)
+
+
+# 文件名必须是纯 ASCII：中文文件名在英文代码页(437)的控制台里显示成乱码，
+# 用户根本找不到这个文件，也就没法发给我们。中文说明写在文件内容里。
+FAIL_LOG_NAME = "hanhua_error_log.txt"
+
+
+def _collect_env_snapshot():
+    """收集一份最小但够用的环境快照。用户描述不清时，全靠这份东西定位。"""
+    import platform
+    lines = []
+    try:
+        lines.append(f"时间      : {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"工具版本  : {TOOL_VERSION}")
+        lines.append(f"系统      : {platform.platform()}")
+        lines.append(f"架构      : {platform.machine()} / Python {platform.python_version()}")
+        lines.append(f"解释器    : {sys.executable}")
+        lines.append(f"输出编码  : {getattr(sys.stdout, 'encoding', '?')}")
+        lines.append(f"工作目录  : {os.getcwd()}")
+        lines.append(f"脚本目录  : {SCRIPT_DIR}")
+        lines.append(f"Python路径: {os.environ.get('PATH', '')[:600]}")
+    except Exception as e:
+        lines.append(f"(环境快照收集失败: {e})")
+    return lines
+
+
+def _write_fail_log(msg):
+    """失败时落一份日志到脚本目录。写不下去就算了，绝不能因为写日志再抛异常。"""
+    try:
+        body = ["=== Antigravity 一键汉化 · 失败记录 ===", ""]
+        body += _collect_env_snapshot()
+        body += ["", "--- 错误信息 ---", str(msg), ""]
+        text = "\n".join(body)
+        for d in (SCRIPT_DIR, tempfile.gettempdir()):
+            try:
+                p = os.path.join(d, FAIL_LOG_NAME)
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(text)
+                print(_fit_glyphs(f"[·] 已写入失败日志：{p}"), flush=True)
+                return p
+            except OSError:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def die(msg, code=1, log=True):
+    """中止程序。
+
+    log=False 用于"预期内的拒绝"：锁冲突（用户重复双击）、用户主动取消、
+    检测到进程让用户手动处理。这些都不是故障，不该在目录里留下"失败记录"，
+    否则用户看到 hanhua_error_log.txt 会误以为程序坏了。
+    """
+    print(_fit_glyphs(f"[✗] {msg}"), flush=True)
+    if log:
+        _write_fail_log(msg)
+    sys.exit(code)
+
+
+# ----------------------------------------------------------------------------
+# 并发防护（重复双击/多窗口同时运行时，只有一个实例能执行，其余安全退出）
+# ----------------------------------------------------------------------------
+LOCK_TIMEOUT = 600  # 锁最长持有 10 分钟（防僵死锁）
+
+def acquire_lock():
+    lock_path = os.path.join(tempfile.gettempdir(), "antigravity_hanhua.lock")
+    if os.path.exists(lock_path):
+        age = time.time() - os.path.getmtime(lock_path)
+        try:
+            with open(lock_path, encoding='utf-8') as f:
+                old_pid = f.read().strip()
+        except Exception:
+            old_pid = "?"
+        if age > LOCK_TIMEOUT:
+            print(f"[!] 发现超过 {LOCK_TIMEOUT//60} 分钟的残留锁（上次进程可能被强杀），已自动清除")
+            try:
+                os.remove(lock_path)
+            except OSError:
+                pass
+        else:
+            die(f"另一个汉化程序正在运行（PID {old_pid}，{int(age)} 秒前启动）。\n"
+                "  为避免文件冲突，请等它完成后重试；若确认没有其他窗口在跑，\n"
+                f"  可删除锁文件：{lock_path}", log=False)
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(str(os.getpid()))
+        return lock_path
+    except FileExistsError:
+        die("另一个汉化程序刚刚启动，本次退出（重复双击无副作用，稍后重试即可）。",
+            log=False)
+    except OSError as e:
+        print(f"[!] 无法创建锁文件（{e}），继续执行但不防并发")
+        return None
+
+
+def release_lock(lock_path):
+    if lock_path and os.path.exists(lock_path):
+        try:
+            with open(lock_path, encoding='utf-8') as f:
+                owner = f.read().strip()
+            # 注意：必须先关闭文件再删除（Windows 不允许删除打开中的文件）
+            if owner == str(os.getpid()):
+                os.remove(lock_path)
+        except OSError:
+            pass
+
+
+# ----------------------------------------------------------------------------
+# 环境与路径
+# ----------------------------------------------------------------------------
+def _resources_from_given(cand):
+    """把用户给的任意路径解析成 resources 目录。支持四种输入：
+       1. 直接就是 resources 目录（含 app.asar）
+       2. .app 包（/Applications/Antigravity.app）
+       3. .app 里的 Contents 目录（此时不会再往下拼 resources，否则得到
+          Contents/resources 这种不存在的路径）
+       4. 安装根目录（其下有 resources/ 或 Contents/Resources/）
+    返回 None 表示这条路径不成立。返回值统一做 normpath 归一化（去掉尾斜杠）。"""
+    if not cand:
+        return None
+    cand = os.path.normpath(cand)
+    # 用户很可能直接把 Antigravity.exe 或 app.asar 拖进来（Windows 上尤其常见）。
+    # 此时取它所在目录再继续判断，比直接报"找不到"友好得多。
+    if os.path.isfile(cand):
+        cand = os.path.dirname(cand)
+    # 先判断是否已经是 resources（含 app.asar），命中直接返回
+    if os.path.isfile(os.path.join(cand, "app.asar")):
+        return cand
+    # 若 basename 是 Contents，说明用户指向了 .app 内部结构，
+    # 其 Resources 就是同级目录，绝不能再拼一层
+    if os.path.basename(os.path.normpath(cand)) == "Contents":
+        cont = os.path.join(cand, "Resources")
+        if os.path.isfile(os.path.join(cont, "app.asar")):
+            return cont
+        return None
+    for rel in (("Contents", "Resources"), ("resources",)):
+        c = os.path.join(cand, *rel)
+        if os.path.isfile(os.path.join(c, "app.asar")):
+            return c
+    return None
+
+
+def find_resources(override=None):
+    """定位 Antigravity 的 resources 目录"""
+    if override:
+        r = _resources_from_given(override)
+        if r:
+            return r
+        die(f"指定路径下未找到 app.asar：{override}\n"
+            "  可以指向：Antigravity 安装目录、resources 目录，\n"
+            "            或 Antigravity.exe / app.asar 文件本身。")
+    if IS_WIN:
+        cands = [os.path.join(p, "resources") for p in WIN_PATHS if p]
+    elif IS_MAC:
+        cands = list(MAC_PATHS)
+        # 固定位置没有时，展开通配（dmg 挂载点 / Homebrew / 应用名变体）
+        import glob as _glob
+        for pat in MAC_PATTERNS:
+            try:
+                cands.extend(sorted(_glob.glob(pat)))
+            except Exception:
+                pass
+    else:
+        cands = list(LINUX_PATHS)
+    for c in cands:
+        if os.path.isfile(os.path.join(c, "app.asar")):
+            return c
+    if IS_MAC:
+        # 最后再试一次广搜：常见位置里逐层找 Antigravity.app
+        found = _mac_deep_search()
+        if found:
+            return found
+        die("未找到 Antigravity 安装目录。\n"
+            "\n"
+            "  预期位置：/Applications/Antigravity.app/Contents/Resources/app.asar\n"
+            "  已自动查找：应用程序、用户应用程序、下载、桌面、外接磁盘挂载点、\n"
+            "            Homebrew 安装目录（均未找到）\n"
+            "\n"
+            "  可能的原因：\n"
+            "    1. Antigravity 还没安装 —— 请先从 antigravity.google 下载安装\n"
+            "    2. 装在了特殊位置 —— 请用 --path 指定，例如：\n"
+            "         python3 localize.py apply --path \"/路径/Antigravity.app\"\n"
+            "    3. 应用名不是 Antigravity —— 请把实际的应用名告诉我")
+    die("未找到 Antigravity 安装目录。\n"
+        "请用 --path 参数指定安装路径（例如：--path \"%LOCALAPPDATA%\\Programs\\antigravity\"）")
+
+
+def _mac_deep_search():
+    """在常见根目录下逐层查找 Antigravity.app（限深度，避免全盘扫描）。
+    返回其 resources 目录，未找到返回 None。"""
+    import glob as _glob
+    roots = [
+        os.path.expanduser("~"),
+        "/Applications",
+        os.path.expanduser("~/Applications"),
+        "/Volumes",
+        "/opt/homebrew/Caskroom",
+        "/usr/local/Caskroom",
+    ]
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            hits = _glob.glob(os.path.join(root, "*", "Antigravity.app"))
+            hits += _glob.glob(os.path.join(root, "Antigravity.app"))
+            hits += _glob.glob(os.path.join(root, "*", "*", "Antigravity.app"))
+        except Exception:
+            continue
+        for app in hits:
+            r = _resources_from_given(app)
+            if r:
+                log(f"已自动定位到 Antigravity：{app}", ok=True)
+                return r
+    return None
+
+
+def find_app_bundle(resources_dir):
+    """macOS：从 resources 目录反推 .app 包路径（代码签名需要）"""
+    if not IS_MAC:
+        return None
+    # resources = /Applications/Antigravity.app/Contents/Resources
+    d = os.path.abspath(resources_dir)
+    for _ in range(4):
+        d = os.path.dirname(d)
+        if d.endswith(".app"):
+            return d
+    return None
+
+
+# npm 缓存不可写时记录原因（None = 一切正常）。cmd_apply 据此决定是否绕开 npx。
+NPM_CACHE_PROBLEM = None
+_NPM_CACHE_CHECKED = False       # 菜单里反复选 1 时不必每次都起一个 npm 进程
+
+
+def probe_npm_cache():
+    """探测 npm 缓存目录能不能写。
+
+    为什么必须探测：npx 每次运行都要往 npm 缓存里落临时文件，缓存目录不可写时
+    （Node 装在 C 盘根目录但只给了管理员权限、整个目录从别的账户拷过来、
+    杀软的勒索防护锁住缓存、缓存被指到只读盘……），npx 会在**真正干活之前**
+    就以 `EPERM: operation not permitted` 退出，还给用户甩一屏 npm 内部栈。
+    更坑的是：解包这步失败会被内置解包器默默兜住，用户以为一切正常，
+    直到最后"重新打包"才炸——那时已经跑了半天。
+
+    提前探测有两个作用：
+      1. 把英文栈换成人话 + 可直接复制的修复命令；
+      2. 直接绕开 npx 走内置工具链，不让整个流程死在这里。
+
+    返回可写的缓存路径（探测不出结论时返回 None，交给 npx 自己报错）。
+    """
+    global NPM_CACHE_PROBLEM, _NPM_CACHE_CHECKED
+    if _NPM_CACHE_CHECKED:
+        return None
+    _NPM_CACHE_CHECKED = True
+    npm = shutil.which("npm")
+    if not npm:
+        return None                      # 没 npm 就没得查，不是本函数的职责
+    try:
+        r = subprocess.run([npm, "config", "get", "cache"], capture_output=True,
+                           text=True, encoding='utf-8', errors='replace', timeout=20)
+        cache = (r.stdout or "").strip() if r.returncode == 0 else ""
+    except Exception:
+        return None                      # npm 本身跑不起来，交给后续步骤报错
+
+    if not cache:
+        return None
+
+    # 常见坑：在 PowerShell 里执行 cmd 写法时 %LOCALAPPDATA% 不会展开，
+    # npm 会把字面量 "%LOCALAPPDATA%\npm-cache" 当路径存下来 —— 同样是坏的。
+    if not os.path.isabs(cache) or "%" in cache:
+        NPM_CACHE_PROBLEM = f"{cache}（不是有效绝对路径，可能是变量没展开）"
+    else:
+        # 探针名带 PID：两个实例同时启动时不会互相删掉对方的文件
+        probe = os.path.join(cache, f"._agyzh_write_probe_{os.getpid()}")
+        try:
+            os.makedirs(cache, exist_ok=True)
+            with open(probe, "wb") as f:
+                f.write(b"ok")
+            os.remove(probe)
+            return cache
+        except OSError as e:
+            NPM_CACHE_PROBLEM = f"{cache}（{e.strerror or e}）"
+
+    log(f"npm 缓存目录不可写：{NPM_CACHE_PROBLEM}", warn=True)
+    log("这会让 npx 在下载工具之前就报 EPERM 失败。修复办法（在 cmd 里执行一次，不需要管理员）：", warn=True)
+    log('    npm config set cache "%LOCALAPPDATA%\\npm-cache"', warn=True)
+    log("本次已自动改用内置解包/打包器，不依赖 npx，可以照常继续。", ok=True)
+    return None
+
+
+def check_env():
+    """检查运行环境：node（打包后语法门禁必需）+ npx（官方 asar 工具，可选）+ macOS 签名工具。
+
+    注意 npx 只影响"用哪种方式打包"：npm 缓存不可写时会被自动跳过，
+    改走内置打包器，所以这里不因 npx 不可用而中止。
+
+    提前检查 codesign 是为了避免"汉化写进去了、App 却打不开"这种最糟的结局
+    却让用户一头雾水。"""
+    node = shutil.which("node")
+    npx = shutil.which("npx")
+    if not node:
+        # node 是硬依赖：解包/打包可以自己来，但"改完的 JS 能不能解析"这道语法门禁
+        # 离不开 node --check。宁可现在说清楚，也不能把没校验的包部署进去。
+        die("未检测到 Node.js（需要 node 命令）。\n"
+            "请安装 Node.js 18+：https://nodejs.org/ 安装时勾选 Add to PATH"
+            + ("（macOS 推荐用 Homebrew：brew install node）" if IS_MAC else ""))
+    if not npx:
+        log("未检测到 npx，本次直接使用内置打包器（不影响汉化结果）", warn=True)
+    else:
+        probe_npm_cache()
+    if IS_MAC:
+        # macOS 特有：改包后必须重签名，缺 codesign 会导致 App 打不开
+        missing = [t for t in ("codesign", "xattr") if shutil.which(t) is None]
+        if missing:
+            die("未检测到 macOS 签名工具：%s\n"
+                "\n"
+                "  这是汉化的**必要条件**：macOS 会对应用包做代码签名，\n"
+                "  我们修改了应用包内容后必须重新签名，否则 Antigravity\n"
+                "  会提示「应用已损坏」而无法打开。\n"
+                "\n"
+                "  解决方法（打开「终端」粘贴执行，需联网，约几分钟）：\n"
+                "      xcode-select --install\n"
+                "\n"
+                "  弹出安装界面后点「安装」，等待完成再重新运行本工具。\n"
+                "  若已安装却仍提示缺失，请重启终端后重试。"
+                % "、".join(missing))
+    return npx
+
+
+class AsarToolError(Exception):
+    """asar 工具执行失败。soft 模式下抛出，交给调用方决定是降级还是中止。"""
+
+
+def asar_run(npx, *args, timeout=300, soft=False):
+    """调用官方 @electron/asar 工具（参数列表形式，无 shell 拼接，防注入）
+
+    soft=True：失败抛 AsarToolError 而不是直接退出，供调用方降级。
+    """
+    if not npx:
+        # 正常流程进不来（builtin_required 会先拦截），纯防御：让降级路径拿到
+        # 一个明确的异常，而不是 [None, "--yes", ...] 触发的 TypeError。
+        if soft:
+            raise AsarToolError("没有可用的 npx")
+        die("没有可用的 npx，无法调用官方 asar 工具。")
+    cmd = [npx, "--yes", "@electron/asar"] + [str(a) for a in args]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           encoding='utf-8', errors='replace')
+    except OSError as e:
+        # npx 命令"存在"但根本执行不了：npm 目录被删了一半、被杀软拦、
+        # 32/64 位错配。不接住会变成 Python traceback，用户看到的是天书。
+        if soft:
+            raise AsarToolError(f"无法启动 asar 工具：{e}")
+        die(f"无法启动 asar 工具（{e}）")
+    except subprocess.TimeoutExpired:
+        if soft:
+            raise AsarToolError("asar 工具执行超时")
+        die("asar 工具执行超时（网络下载依赖可能过慢），请重试")
+    if r.returncode != 0:
+        msg = f"asar 工具执行失败：{' '.join(cmd[:5])}...\n{r.stderr[-800:] or r.stdout[-800:]}"
+        if soft:
+            raise AsarToolError(msg)
+        die(msg)
+    return r.stdout
+
+
+def asar_extract_py(asar_path, out_dir):
+    """纯 Python 解包 app.asar（官方工具失败时的回退方案）。
+
+    为什么需要它：@electron/asar 的 extract 是"一个坏条目带走全部"——
+    header 里声明为 unpacked、但 app.asar.unpacked 下实际缺少该文件时，
+    它会直接抛错退出，前面已解出的内容全部作废。
+    Antigravity 2.28.1 就有这种条目（chrome-devtools-mcp 漏了 1 个 .md），
+    1085 个条目里坏 1 个，官方包自身的问题，不是汉化造成的。
+
+    这里逐条处理：缺失的外部文件跳过并记录，不阻塞汉化。
+    跳过意味着重打包后该条目消失——与官方包"实际读不到"的状态一致，不影响运行。
+
+    返回 (解出文件数, 跳过的相对路径列表, 跳过的符号链接列表)
+    """
+    import struct as _struct
+    f = open(asar_path, 'rb')
+    try:
+        head = f.read(16)
+        if len(head) < 16:
+            die("app.asar 头部异常，文件可能已损坏")
+        # 与 read_asar_header 保持同一套校验：magic 必须是 4。
+        # 少了这道校验，把非 asar 文件喂进来会解析出垃圾目录树然后继续跑，
+        # 最后在别处以莫名其妙的方式失败。
+        #
+        # 四个 UInt32 的含义（别搞混，搞混一次就白解包）：
+        #   [0:4]  magic（固定 4）  [4:8]  size  [8:12] header_size  [12:16] header_str_size
+        # 数据区起点 base = 12 + header_size（用的是**第 3 个**，不是第 2 个）。
+        magic, _size, header_size, header_str_size = _struct.unpack('<4I', head)
+        if magic != 4:
+            die("app.asar 头部 magic 异常（不是标准 asar 文件），已停止解包")
+        f.seek(16)
+        header = json.loads(f.read(header_str_size).decode('utf-8'))
+        base = 12 + header_size
+        unpacked_dir = asar_path + ".unpacked"
+        counter = [0]
+        skipped = []
+        links = []
+
+        def walk(node, prefix):
+            for name, entry in node.get('files', {}).items():
+                rel = os.path.join(prefix, name) if prefix else name
+                if 'files' in entry:
+                    os.makedirs(os.path.join(out_dir, rel), exist_ok=True)
+                    walk(entry, rel)
+                    continue
+                if 'link' in entry:
+                    # 符号链接：Windows 创建需特权，官方包当前不含此类条目。
+                    # 不静默丢弃——记下来由调用方提示，否则重打包后链接会无声消失。
+                    links.append(rel.replace(os.sep, '/'))
+                    continue
+                dest = os.path.join(out_dir, rel)
+                parent = os.path.dirname(dest)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                if entry.get('unpacked'):
+                    # 注意顺序：unpacked 条目在 header 里**没有 offset 字段**
+                    # （它们在 asar 里只占一个索引位，真正内容在 .unpacked 目录）。
+                    # 所以必须先用 unpacked 分流，再谈 offset，否则会把所有外部文件
+                    # 当成"无 offset 异常"全跳掉——这个顺序错过一次，
+                    # 表现是只解出 738 个文件、连 package.json 都没有。
+                    src = os.path.join(unpacked_dir, rel)
+                    if not os.path.isfile(src):
+                        skipped.append(rel.replace(os.sep, '/'))
+                        continue
+                    shutil.copy2(src, dest)
+                elif 'offset' in entry:
+                    f.seek(base + int(entry['offset']))
+                    with open(dest, 'wb') as out:
+                        out.write(f.read(entry['size']))
+                else:
+                    # 既不是目录、链接、unpacked，也没有 offset：未知条目类型。
+                    # 记录下来跳过，别让 entry['offset'] 抛 KeyError 把整个流程带崩。
+                    skipped.append(rel.replace(os.sep, '/') + '（无 offset 字段）')
+                    continue
+                counter[0] += 1
+
+        walk(header, '')
+        return counter[0], skipped, links
+    finally:
+        f.close()
+
+
+# ----------------------------------------------------------------------------
+# asar 写入侧：内置打包器 + 自校验（官方 @electron/asar 不可用时的完整回退）
+# ----------------------------------------------------------------------------
+# 为什么必须自己实现"写"：npx 跑不起来时（npm 缓存 EPERM、公司网络装不上包、
+# Node 环境残缺、杀软拦截），官方工具连启动都做不到，而汉化最后一步恰恰是
+# "把改好的目录重新打回 app.asar"——只有只读的降级路径等于死路一条。
+#
+# 二进制格式必须与 @electron/asar 4.x 逐字段对齐，否则 Electron 会按错误的
+# 偏移读数据，表现是白屏/启动失败，而且几乎无法反查。实测对照的真实头部：
+#   [0:4]   UInt32 固定 4
+#   [4:8]   UInt32 sizeBuf 里写的 headerBuf.length = 8 + align4(jsonLen)
+#   [8:12]  UInt32 headerPickle 的 payloadSize = 4 + align4(jsonLen)
+#   [12:16] UInt32 真实 jsonLen（不带 padding）
+#   [16:]   JSON + 补零到 4 字节对齐
+#   数据区起点 = 12 + [8:12] = 16 + align4(jsonLen)
+ASAR_BLOCK_SIZE = 4 * 1024 * 1024      # 与官方 integrity.js 的 BLOCK_SIZE 一致
+ASAR_MAX_FILE = 0xFFFFFFFF             # 官方的 UINT32_MAX 上限（单个文件 4GB）
+
+
+def _walk_raise(e):
+    """os.walk 的错误处理器：默认行为是把权限错误吞掉、静默跳过读不了的目录，
+    结果就是「包里悄悄缺文件」和「校验看着一致」同时发生。这里一律抛出。"""
+    raise e
+
+
+def _js_sort_key(s):
+    """模拟 JS 默认字符串排序（按 UTF-16 码元逐个比较）。
+
+    Python 的 str 排序按 Unicode 码点比，在增补平面字符（emoji、部分生僻汉字）上
+    顺序与 JS 相反：U+1F600 的 UTF-16 首码元是 0xD83D(55357)，小于 U+FF5A(65370)；
+    而它的码点 0x1F600(128512) 又大于 0xFF5A。实测两个文件打包后 header 键序颠倒。
+    排序只影响 header 键序：功能不受影响，但做不到与官方产物逐字节一致。
+    """
+    raw = s.encode("utf-16-be", "surrogatepass")
+    return tuple(int.from_bytes(raw[i:i + 2], "big") for i in range(0, len(raw), 2))
+
+
+def _sha256_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(1024 * 1024)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def asar_file_integrity(path):
+    """按 @electron/asar 的规则算一个文件的完整性记录。
+
+    结构与官方 integrity.js 的 getFileIntegrity() 完全一致：
+        {"algorithm":"SHA256", "hash":<整文件 hex>,
+         "blockSize":4194304, "blocks":[<每 4MB 一块的 hex>]}
+
+    三个容易踩的点：
+      * hash 是**十六进制**字符串，不是 base64（Electron 只认 hex）；
+      * 分块按 4MB 累计切，不能按读取批次切（读取 chunk 可以任意大小）；
+      * 空文件也必须有一个 block（空内容的 sha256），blocks 留空会让校验失败。
+
+    返回 (integrity 字典, 文件字节数)
+    """
+    import hashlib
+    whole = hashlib.sha256()
+    blk = hashlib.sha256()
+    blocks = []
+    filled = 0
+    size = 0
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            whole.update(chunk)
+            pos = 0
+            while pos < len(chunk):
+                take = min(ASAR_BLOCK_SIZE - filled, len(chunk) - pos)
+                blk.update(chunk[pos:pos + take])
+                filled += take
+                pos += take
+                if filled == ASAR_BLOCK_SIZE:
+                    blocks.append(blk.hexdigest())
+                    blk = hashlib.sha256()
+                    filled = 0
+    if filled > 0 or not blocks:
+        blocks.append(blk.hexdigest())
+    return ({"algorithm": "SHA256", "hash": whole.hexdigest(),
+             "blockSize": ASAR_BLOCK_SIZE, "blocks": blocks}, size)
+
+
+def asar_pack_py(src_dir, out_asar, unpack_prefixes=None):
+    """纯 Python 打包 asar（官方 @electron/asar 不可用时的回退方案）。
+
+    unpack_prefixes：需要外部化到 `<out>.unpacked/` 的路径前缀（'/' 分隔）。
+    语义与官方 `--unpack-dir` 一致：文件相对路径等于前缀、或以 "前缀/" 开头即外部化。
+
+    返回 (包内文件数, 外部化文件数, 产物字节数, 实际外部化的路径集合)
+    """
+    import struct
+
+    src_dir = os.path.abspath(src_dir)
+    if not os.path.isdir(src_dir):
+        raise RuntimeError(f"待打包目录不存在：{src_dir}")
+
+    prefixes = []
+    for p in (unpack_prefixes or []):
+        p = str(p).strip().strip("/\\").replace("\\", "/")
+        if p and p not in prefixes:
+            prefixes.append(p)
+
+    def should_unpack(rel_slash):
+        for p in prefixes:
+            if rel_slash == p or rel_slash.startswith(p + "/"):
+                return True
+        return False
+
+    # 1) 收集全部路径并做全局字符串排序。
+    #    官方 crawlfs 是 crawled.sort()（JS 默认按 UTF-16 码元排序），这里必须用
+    #    _js_sort_key 而不是 Python 默认排序，否则增补平面字符会排错位置。
+    dirs_rel, files_rel = [], []
+    for root, dnames, fnames in os.walk(src_dir, onerror=_walk_raise):
+        rel_root = os.path.relpath(root, src_dir)
+        rel_root = "" if rel_root == "." else rel_root
+        for d in dnames:
+            dirs_rel.append(os.path.join(rel_root, d) if rel_root else d)
+        for fn in fnames:
+            files_rel.append(os.path.join(rel_root, fn) if rel_root else fn)
+    all_rel = sorted(set(dirs_rel) | set(files_rel),
+                     key=lambda p: _js_sort_key(p.replace(os.sep, "/")))
+
+    header = {"files": {}}
+
+    def node_for(rel):
+        """取（必要时创建）目录链节点。与官方 searchNodeFromDirectory 行为一致。"""
+        cur = header
+        if not rel:
+            return cur
+        for part in rel.replace(os.sep, "/").split("/"):
+            cur = cur.setdefault("files", {}).setdefault(part, {"files": {}})
+        return cur
+
+    packed = unpacked = 0
+    offset = 0
+    seen_hash = {}          # 官方 4.x 会按内容 hash 复用数据段，这里保持一致，避免体积翻倍
+    pending = []            # [(源路径, 相对路径, 是否外部化)]
+    unpacked_paths = set()
+
+    for rel in all_rel:
+        abs_path = os.path.join(src_dir, rel)
+        rel_slash = rel.replace(os.sep, "/")
+        parent_node = node_for(os.path.dirname(rel))
+        name = os.path.basename(rel)
+
+        if os.path.islink(abs_path):
+            # 符号链接在 asar 里是 {"link": 目标} 条目，不是文件内容。
+            # 内置打包器不重建它：os.walk 不跟随链接目录，会把链接当成空目录写进
+            # header —— 内容凭空消失且校验也查不出来（那种包能启动但功能缺失）。
+            # 宁可明确失败，也不能产出这种包。
+            raise RuntimeError(
+                f"待打包目录里含符号链接，内置打包器不支持：{rel_slash}\n"
+                "  请先修复 npm 环境（让 npx 可用）后重试。")
+
+        if os.path.isdir(abs_path):
+            node = parent_node["files"].setdefault(name, {})
+            # 键序对齐官方 insertDirectory：先 unpacked 再 files。
+            # 顺序反了功能一样（Electron 按 key 查），但整包就做不到与官方
+            # 产物逐字节一致，日后比对差异会被这个假信号带偏。
+            if should_unpack(rel_slash):
+                node["unpacked"] = True
+            node.setdefault("files", {})
+            continue
+
+        if not os.path.isfile(abs_path):
+            raise RuntimeError(f"不是普通文件，无法打包：{rel}")
+
+        node = parent_node["files"].setdefault(name, {})
+        integrity, size = asar_file_integrity(abs_path)
+        if size > ASAR_MAX_FILE:
+            raise RuntimeError(f"单个文件超过 4.2GB，asar 格式不支持：{rel}")
+        node["size"] = size
+        if should_unpack(rel_slash):
+            # 外部文件在 asar 里只留索引，没有 offset（内容在 .unpacked 目录）
+            node["unpacked"] = True
+            node["integrity"] = integrity
+            unpacked += 1
+            unpacked_paths.add(rel_slash)
+            pending.append((abs_path, rel, True))
+        else:
+            h = integrity["hash"]
+            # 键序对齐官方 storeFileEntry：size → offset → [executable] → integrity
+            if h in seen_hash:
+                node["offset"] = seen_hash[h]
+            else:
+                node["offset"] = str(offset)
+                seen_hash[h] = str(offset)
+                offset += size
+                pending.append((abs_path, rel, False))
+            if not IS_WIN and (os.stat(abs_path).st_mode & 0o100):
+                node["executable"] = True
+            node["integrity"] = integrity
+            packed += 1
+
+    # 2) 序列化 header：与 JSON.stringify 对齐（无空格、不转义非 ASCII）
+    #    ensure_ascii=False 不能省：官方 JSON.stringify 直接输出原始 UTF-8 字符，
+    #    默认的 True 会把中文/日文文件名转成 \uXXXX，header 变长且与官方产物对不上。
+    json_bytes = json.dumps(header, separators=(",", ":"),
+                            ensure_ascii=False).encode("utf-8")
+    json_len = len(json_bytes)
+    padded = (json_len + 3) & ~3
+    header_payload = 4 + padded           # Pickle payloadSize = 长度前缀 + 对齐后的 JSON
+    head = struct.pack("<4I",
+                       4,
+                       8 + padded,        # sizeBuf 里写的 headerBuf.length
+                       header_payload,    # headerPickle 的 payloadSize
+                       json_len)          # 真实 JSON 长度（不带 padding）
+
+    # 3) 落盘：先写 .part 再改名，避免中途失败留下半个"看起来存在"的 asar
+    out_unpacked = out_asar + ".unpacked"
+    if os.path.isdir(out_unpacked):
+        shutil.rmtree(out_unpacked, ignore_errors=True)
+    if unpacked:
+        os.makedirs(out_unpacked, exist_ok=True)
+    part = out_asar + ".part"
+    try:
+        with open(part, "wb") as f:
+            f.write(head)
+            f.write(json_bytes)
+            f.write(b"\x00" * (padded - json_len))
+            for abs_path, rel, is_unpack in pending:
+                if is_unpack:
+                    dest = os.path.join(out_unpacked, rel)
+                    parent = os.path.dirname(dest)
+                    if parent:
+                        os.makedirs(parent, exist_ok=True)
+                    shutil.copyfile(abs_path, dest)
+                else:
+                    with open(abs_path, "rb") as srcf:
+                        shutil.copyfileobj(srcf, f, 1024 * 1024)
+        os.replace(part, out_asar)
+    except Exception:
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        raise
+    return packed, unpacked, os.path.getsize(out_asar), unpacked_paths
+
+
+def asar_verify_archive(asar_path, src_dir, expect_unpacked=None):
+    """把刚打好的包原样读回来，逐文件与源目录核对（内置打包器的自证手段）。
+
+    "写进去了"不等于"能读对"：Electron 完全依赖 header 里的 offset/size 定位
+    内容，少算 1 个字节就会读出错位的垃圾。所以必须闭环验证——
+        源文件 sha256 == header 记录的 hash == 从包内按 offset/size 读回的 sha256
+    再核对文件集合与外部化清单。任何一项不符都不允许部署。
+
+    返回问题描述列表（空列表 = 全部通过）。
+    """
+    import struct
+    import hashlib
+
+    problems = []
+    src_dir = os.path.abspath(src_dir)
+    archive_size = os.path.getsize(asar_path)
+
+    with open(asar_path, "rb") as f:
+        head = f.read(16)
+        if len(head) < 16:
+            return ["产物头部不足 16 字节"]
+        magic, _size, header_size, header_str_size = struct.unpack("<4I", head)
+        if magic != 4:
+            return [f"产物 magic 异常（{magic}）"]
+        f.seek(16)
+        try:
+            header = json.loads(f.read(header_str_size).decode("utf-8"))
+        except Exception as e:
+            return [f"产物 header 解析失败（{e}）"]
+        base = 12 + header_size
+        unpacked_dir = asar_path + ".unpacked"
+        found = set()
+
+        def walk(node, prefix):
+            for name, entry in node.get("files", {}).items():
+                rel = f"{prefix}/{name}" if prefix else name
+                if "files" in entry:
+                    walk(entry, rel)
+                    continue
+                if "link" in entry:
+                    # 链接条目也要计入 found：源目录里它是符号链接（os.walk 会列出），
+                    # 不算进来会被反向核对误报成"漏打包"。
+                    found.add(rel)
+                    continue
+                found.add(rel)
+                integ = entry.get("integrity") or {}
+                want = integ.get("hash")
+                src_path = os.path.join(src_dir, rel.replace("/", os.sep))
+                if not os.path.isfile(src_path):
+                    problems.append(f"{rel}：源目录里没有这个文件")
+                    continue
+                try:
+                    got = _sha256_file(src_path)
+                except OSError as e:
+                    problems.append(f"{rel}：读源文件失败（{e}）")
+                    continue
+                if not want:
+                    problems.append(f"{rel}：header 缺少 integrity")
+                elif got != want:
+                    problems.append(f"{rel}：header 记录的 hash 与源文件不符")
+                if entry.get("unpacked"):
+                    ext = os.path.join(unpacked_dir, rel.replace("/", os.sep))
+                    if not os.path.isfile(ext):
+                        problems.append(f"{rel}：声明外部化但 .unpacked 下缺文件")
+                    elif _sha256_file(ext) != got:
+                        problems.append(f"{rel}：.unpacked 里的内容与源文件不符")
+                    continue
+                off = entry.get("offset")
+                if off is None:
+                    problems.append(f"{rel}：既没有 offset 也没声明 unpacked")
+                    continue
+                try:
+                    off = int(off)
+                    size = int(entry.get("size", -1))
+                except (TypeError, ValueError):
+                    problems.append(f"{rel}：offset/size 不是整数")
+                    continue
+                if size != os.path.getsize(src_path):
+                    problems.append(f"{rel}：size 与源文件大小不符")
+                if off < 0 or base + off + size > archive_size:
+                    problems.append(f"{rel}：数据区间越界")
+                    continue
+                f.seek(base + off)
+                data = f.read(size)
+                if len(data) != size:
+                    problems.append(f"{rel}：按 offset/size 只读到 {len(data)} 字节")
+                elif hashlib.sha256(data).hexdigest() != got:
+                    problems.append(f"{rel}：包内实际字节与源文件不一致")
+
+        walk(header, "")
+
+        # 反向核对：源目录里每个文件都必须出现在包中（漏打包会静默丢功能）
+        for root, _dirs, fnames in os.walk(src_dir, onerror=_walk_raise):
+            rel_root = os.path.relpath(root, src_dir)
+            rel_root = "" if rel_root == "." else rel_root
+            for fn in fnames:
+                p = (rel_root + os.sep + fn) if rel_root else fn
+                ps = p.replace(os.sep, "/")
+                if ps not in found:
+                    problems.append(f"{ps}：源目录有、产物里没有（漏打包）")
+
+        if expect_unpacked is not None:
+            got_up = get_unpacked_set(asar_path)
+            for miss in sorted(set(expect_unpacked) - got_up)[:5]:
+                problems.append(f"{miss}：应外部化却没标记 unpacked")
+    return problems
+
+
+def builtin_required(npx):
+    """是否必须完全绕开 npx（没有 npx，或 npm 缓存不可写）"""
+    return (not npx) or (NPM_CACHE_PROBLEM is not None)
+
+
+def _report_extract_skips(skipped_unpacked, skipped_links):
+    """内置解包器跳过项的统一提示（两类跳过原因完全不同，别合并成一条）"""
+    if skipped_unpacked:
+        log(f"跳过 {len(skipped_unpacked)} 个官方包自身缺失/异常的条目（与汉化无关，不影响使用）：", warn=True)
+        for _s in skipped_unpacked[:5]:
+            log(f"    {_s}", warn=True)
+    if skipped_links:
+        log(f"跳过 {len(skipped_links)} 个符号链接（Windows 无法重建，重打包后会消失）：", warn=True)
+        for _s in skipped_links[:5]:
+            log(f"    {_s}", warn=True)
+        log("若汉化后出现异常，请把这段信息反馈给维护者", warn=True)
+
+
+def extract_any(npx, asar_path, out_dir, quiet=False):
+    """解包：能走官方工具就走，走不通自动降级内置解包器。
+
+    返回 (实际使用的工具, 跳过的外部条目, 跳过的符号链接)，工具为 "npx"/"builtin"。
+    """
+    if builtin_required(npx):
+        n_files, skipped, links = asar_extract_py(asar_path, out_dir)
+        if not quiet:
+            log(f"内置解包器完成：{n_files} 个文件", ok=True)
+            _report_extract_skips(skipped, links)
+        return "builtin", skipped, links
+    try:
+        asar_run(npx, "extract", asar_path, out_dir, soft=True)
+        return "npx", [], []
+    except AsarToolError:
+        # 两个来源会导致这里失败：npm 环境坏（缓存不可写等）或官方包自身有坏条目。
+        # 两种情况内置解包器都能扛，所以统一降级，不再区分。
+        log("官方 asar 工具解包失败，改用内置解包器处理", warn=True)
+        n_files, skipped, links = asar_extract_py(asar_path, out_dir)
+        if not quiet:
+            log(f"内置解包器完成：{n_files} 个文件", ok=True)
+            _report_extract_skips(skipped, links)
+        return "builtin", skipped, links
+
+
+def _discard_partial(out_asar):
+    """清掉内置打包器的半成品，绝不留下"看起来存在"的残包"""
+    for p in (out_asar + ".part", out_asar, out_asar + ".unpacked"):
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+            elif os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def pack_any(npx, src_dir, out_asar, unpack_pattern, unpack_prefixes,
+             force_builtin=False):
+    """打包：优先官方工具，失败或环境不可用时用内置打包器（带闭环自校验）。
+
+    force_builtin：外部化目录有多处时置 True。官方 `--unpack-dir` 只接受单条
+    前缀/模式，多目录只能靠花括号拼 glob，而它对 isUnpackedDir 的 startsWith
+    判定无效——结果是外部文件全被塞回包内、结构守卫必然报缺失。这种情况直接
+    用支持多前缀的内置打包器，别让它撞上一条注定失败的路径。
+
+    返回 "npx" / "builtin"。内置路径任何失败都转成 AsarToolError 抛出，
+    由调用方中止——绝不允许把未经核对的新包替换上去。
+    """
+    if not (force_builtin or builtin_required(npx)):
+        try:
+            # soft=True 是降级的前提：不带它会直接 die，下面的 except 永远等不到异常。
+            if unpack_pattern:
+                asar_run(npx, "pack", src_dir, out_asar,
+                         "--unpack-dir", unpack_pattern, soft=True)
+            else:
+                asar_run(npx, "pack", src_dir, out_asar, soft=True)
+            return "npx"
+        except AsarToolError:
+            log("官方 asar 工具打包失败，改用内置打包器", warn=True)
+    elif force_builtin and not builtin_required(npx):
+        log(f"外部目录有 {len(unpack_prefixes)} 处，官方 --unpack-dir 只能表达单条前缀，"
+            "改用内置打包器", warn=True)
+
+    try:
+        packed, unpacked, nbytes, unpacked_paths = asar_pack_py(
+            src_dir, out_asar, unpack_prefixes)
+        log(f"内置打包器完成：{packed} 个文件写入包内、{unpacked} 个外部化，"
+            f"产物 {nbytes // 1024} KB", ok=True)
+        problems = asar_verify_archive(out_asar, src_dir,
+                                       expect_unpacked=unpacked_paths)
+    except AsarToolError:
+        raise
+    except Exception as e:
+        # 内置路径的失败五花八门（磁盘满、文件被占用、权限不足、含符号链接、
+        # 目录读不了……），调用方只认 AsarToolError。不转就会直接喷 traceback，
+        # 用户看到的是 Python 栈而不是"打包失败，原包未改动"。
+        _discard_partial(out_asar)
+        raise AsarToolError(f"内置打包失败：{e}")
+    if problems:
+        _discard_partial(out_asar)
+        raise AsarToolError("内置打包自校验未通过：" + "；".join(problems[:3]))
+    log("内置打包自校验通过：所有文件按 offset 读回后与源文件逐字节一致", ok=True)
+    return "builtin"
+
+
+def node_check(files):
+    """语法门禁：对所有被修改的 JS 文件做 node --check 静态校验。
+    任何异常都视为"校验不通过"——宁可中止，也不能让未校验的产物部署。"""
+    bad = []
+    for f in files:
+        try:
+            r = subprocess.run(["node", "--check", f], capture_output=True, text=True,
+                               encoding='utf-8', errors='replace')
+        except Exception as e:
+            bad.append((f, f"无法执行 node --check：{e}"))
+            continue
+        if r.returncode != 0:
+            bad.append((f, (r.stderr or r.stdout)[-500:]))
+    return bad
+
+
+# ----------------------------------------------------------------------------
+# 进程管理
+# ----------------------------------------------------------------------------
+def _safe_run(cmd, timeout=30):
+    """执行命令并忽略一切失败。用于杀进程、启动应用这类
+    "失败也不影响主流程"的场景，避免因系统异常中断整个汉化。"""
+    try:
+        return subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except Exception:
+        return None
+
+
+def _mac_running_pids(app_bundle=None):
+    """macOS：列出 Antigravity 相关进程 (pid, 可执行路径)。
+    用 ps -axo pid,comm 拿 PID 与可执行文件全路径，再按路径精确过滤——
+    绝不使用 `pkill -f Antigravity` 这种模糊匹配：它会误杀其他目录下的同名程序，
+    甚至可能杀掉本脚本自身（脚本路径里就含 Antigravity 字样）。"""
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,comm="],
+                             capture_output=True, text=True,
+                             encoding='utf-8', errors='replace').stdout
+    except Exception:
+        return []
+    marker = os.path.abspath(app_bundle).lower() if app_bundle else ""
+    hits = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        pid_s, path = parts
+        try:
+            pid = int(pid_s)
+        except ValueError:
+            continue
+        low = path.lower()
+        base = os.path.basename(low)
+        if marker and low.startswith(marker + os.sep):
+            hits.append((pid, path))
+        elif base in ("antigravity", "language_server", "antigravity helper"):
+            # 路径可读但不在预期包内（用户装在非常规位置）——文件名精确匹配才认
+            hits.append((pid, path))
+    me = os.getpid()
+    return [(p, path) for p, path in hits if p != me]
+
+
+def kill_processes(auto=False, resources_dir=None):
+    """关闭 Antigravity 相关进程。按可执行文件路径过滤，只杀安装目录下的进程——
+    其他软件恰好同名（如 language_server）的进程绝不误杀。"""
+    if IS_MAC:
+        app_bundle = find_app_bundle(resources_dir)
+        procs = _mac_running_pids(app_bundle)
+        if not procs:
+            return
+        desc = ", ".join(f"{os.path.basename(p)}({pid})" for pid, p in procs[:6])
+        if len(procs) > 6:
+            desc += f" 等 {len(procs)} 个进程"
+        if not auto:
+            print(f"[!] 检测到正在运行：{desc}")
+            ans = input("    需要关闭它们才能继续，是否关闭？(Y/n)：").strip().lower()
+            if ans not in ("", "y", "yes"):
+                die("已取消。请手动退出 Antigravity 后重试（菜单栏图标 → 退出）。",
+                    log=False)
+        log(f"正在关闭进程：{desc}")
+        for pid, _ in procs:
+            _safe_run(["kill", "-TERM", str(pid)])
+        for _ in range(15):
+            time.sleep(0.2)
+            if not _mac_running_pids(app_bundle):
+                log("进程已全部退出", ok=True)
+                return
+        for pid, _ in _mac_running_pids(app_bundle):
+            _safe_run(["kill", "-KILL", str(pid)])
+        time.sleep(0.5)
+        if _mac_running_pids(app_bundle):
+            log("部分进程未退出（若有 Helper 残留，建议重启后再试）", warn=True)
+        else:
+            log("进程已全部退出", ok=True)
+        return
+
+    if not IS_WIN:
+        # Linux：通过 /proc/<pid>/exe 精确匹配安装目录下的进程，避免误杀其他编辑器的 language_server
+        app_root = os.path.dirname(os.path.normpath(resources_dir)) if resources_dir else ""
+        ide_out_dir = find_ide_out(resources_dir)
+        ide_root = os.path.dirname(os.path.dirname(os.path.dirname(ide_out_dir))) if ide_out_dir else ""
+        roots = [os.path.realpath(x) for x in (app_root, ide_root) if x]
+        targets = []
+        if os.path.isdir("/proc"):
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                exe_link = os.path.join("/proc", entry, "exe")
+                try:
+                    exe_path = os.path.realpath(exe_link)
+                except OSError:
+                    continue
+                if any(exe_path == r or exe_path.startswith(r + os.sep) for r in roots):
+                    targets.append((int(entry), os.path.basename(exe_path)))
+        if not targets:
+            return
+        desc = ", ".join(f"{name}({pid})" for pid, name in targets)
+        if not auto:
+            print(f"[!] 检测到正在运行：{desc}")
+            ans = input("    需要关闭它们才能继续，是否关闭？(Y/n)：").strip().lower()
+            if ans not in ("", "y", "yes"):
+                die("已取消。请手动退出 Antigravity 后重试。", log=False)
+        log(f"正在关闭进程：{desc}")
+        import signal
+        for pid, _ in targets:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        for _ in range(15):
+            time.sleep(0.3)
+            if not any(os.path.exists(f"/proc/{pid}") for pid, _ in targets):
+                log("进程已全部退出", ok=True)
+                return
+        log("部分进程未退出，尝试 SIGKILL ...", warn=True)
+        for pid, _ in targets:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        return
+
+    # Windows：枚举进程的可执行路径，只处理 Antigravity 目录下的
+    marker = (resources_dir or "").replace("/", "\\").lower()
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'Antigravity.exe' "
+             "-or $_.Name -eq 'language_server.exe' } | "
+             "Select-Object Name,ProcessId,ExecutablePath | ConvertTo-Json -Compress"],
+            capture_output=True, text=True, timeout=30, encoding='utf-8', errors='replace').stdout
+        procs = json.loads(out) if out.strip() else []
+        if isinstance(procs, dict):
+            procs = [procs]
+    except Exception:
+        procs = []
+    targets, unknown_generic = [], []
+    for p in procs:
+        path = (p.get("ExecutablePath") or "").replace("/", "\\").lower()
+        name = p.get("Name", "")
+        if marker and path and marker in path:
+            targets.append(p)
+        elif name == "Antigravity.exe":
+            # Antigravity.exe 名称足够独特；路径不可读时也视为目标
+            targets.append(p)
+        elif name == "language_server.exe" and not path:
+            # 路径读不到的同名进程：仅在确认本机 Antigravity 在跑时才视为疑似目标
+            unknown_generic.append(p)
+    if unknown_generic and (targets or any(p.get("Name") == "Antigravity.exe" for p in procs)):
+        targets.extend(unknown_generic)
+
+    if not targets:
+        return
+    desc = ", ".join(f"{p['Name']}({p['ProcessId']})" for p in targets)
+    if not auto:
+        print(f"[!] 检测到正在运行：{desc}")
+        ans = input("    需要关闭它们才能继续，是否关闭？(Y/n)：").strip().lower()
+        if ans not in ("", "y", "yes"):
+            die("已取消。请手动退出 Antigravity 后重试。", log=False)
+    log(f"正在关闭进程：{desc}")
+    for p in targets:
+        _safe_run(["taskkill", "/F", "/PID", str(p["ProcessId"])])
+    for _ in range(20):
+        time.sleep(0.3)
+        _t = _safe_run(["tasklist"])
+        task = (_t.stdout.decode("utf-8", "replace").lower()
+                if _t is not None and _t.stdout else "")
+        if not any(f"{p['Name'].lower()} " in task or task.endswith(p["Name"].lower()) for p in targets):
+            log("进程已全部退出", ok=True)
+            return
+    log("部分进程未退出，继续尝试（若部署失败请重启电脑后再试）", warn=True)
+
+
+def launch_app(resources_dir):
+    if IS_WIN:
+        exe = os.path.join(os.path.dirname(resources_dir), "Antigravity.exe")
+        if not os.path.isfile(exe):
+            return
+        # Windows 启动必须"断干净"，否则会踩三个坑（用户实测反馈）：
+        #   1. Antigravity 的日志（DevTools 端口、wsl.exe 报错、自动更新）直接刷在本窗口上，
+        #      满屏英文乱码，把菜单提示顶没了；
+        #   2. 本窗口和它共享同一个控制台，用户点右上角 X 关窗口时，系统会发 CTRL_CLOSE
+        #      给控制台里的所有进程，Antigravity 跟着一起退出；
+        #   3. 反过来，程序执行完退出后窗口也不关（控制台还被 Antigravity 占着），
+        #      看起来就像"输 0 没反应、关不掉"。
+        # 解法：DETACHED_PROCESS 让它彻底脱离当前控制台，三路标准流全部指向 NUL，
+        #      再配 CREATE_NEW_PROCESS_GROUP 免得 Ctrl+C 波及到它。
+        flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        # 关键：从 Electron 系终端（VS Code / WorkBuddy / Cursor 等）里运行时，
+        # 环境里会带着 ELECTRON_RUN_AS_NODE=1。Antigravity 本身也是 Electron 应用，
+        # 继承到这个变量后会被当成 Node 解释器启动：不弹窗、立刻以 0 退出，
+        # 看起来就像"汉化把软件搞坏了"。这里必须显式剔除。
+        child_env = {k: v for k, v in os.environ.items() if k.upper() != "ELECTRON_RUN_AS_NODE"}
+        try:
+            p = subprocess.Popen(
+                [exe], cwd=os.path.dirname(exe),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True, creationflags=flags, env=child_env)
+        except Exception:
+            # 极端情况（沙箱/权限拦截）退回老办法：能启动就行，代价是日志会打到本窗口
+            try:
+                os.startfile(exe)  # noqa
+                log("已启动 Antigravity（兼容模式：它的日志可能会刷在本窗口）", ok=True)
+            except Exception as e2:
+                log(f"启动失败：{e2}（可手动打开）", warn=True)
+            return
+        time.sleep(0.8)
+        if p.poll() is not None:
+            log("启动失败：进程立刻退出了（可手动双击 Antigravity 试一次）", warn=True)
+            return
+        log("已启动 Antigravity（独立进程，关掉本窗口不会影响它）", ok=True)
+        return
+    if IS_MAC:
+        bundle = find_app_bundle(resources_dir) or "/Applications/Antigravity.app"
+        if not os.path.isdir(bundle):
+            log(f"未找到应用包：{bundle}（可手动打开）", warn=True)
+            return
+        try:
+            r = subprocess.run(["open", bundle], capture_output=True, text=True,
+                               encoding='utf-8', errors='replace')
+        except Exception as e:
+            log(f"启动失败：{e}（可手动从「应用程序」打开）", warn=True)
+            return
+        if r.returncode == 0:
+            log("已启动 Antigravity", ok=True)
+        else:
+            log(f"启动失败：{(r.stderr or '').strip()[:200]}\n"
+                "  若提示「应用已损坏」，请看 README 的「打不开怎么办」一节。", warn=True)
+        return
+    if IS_LINUX:
+        app_root = os.path.dirname(os.path.normpath(resources_dir))
+        cands = [
+            os.path.join(app_root, "antigravity"),
+            os.path.join(app_root, "Antigravity"),
+            shutil.which("antigravity"),
+        ]
+        exe = next((c for c in cands if c and os.path.isfile(c)), None)
+        if not exe:
+            log("请从应用菜单或终端手动启动 Antigravity。", warn=True)
+            return
+        child_env = {k: v for k, v in os.environ.items() if k.upper() != "ELECTRON_RUN_AS_NODE"}
+        try:
+            subprocess.Popen(
+                [exe], cwd=os.path.dirname(exe),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True, close_fds=True, env=child_env,
+            )
+            log("已启动 Antigravity（独立进程）", ok=True)
+        except Exception as e:
+            log(f"启动失败：{e}（可手动打开）", warn=True)
+
+
+# ----------------------------------------------------------------------------
+# macOS 代码签名（Mac 版的关键差异，Windows 无此环节）
+# ----------------------------------------------------------------------------
+# 为什么必须做：
+#   macOS 对 .app 包做整体代码签名。我们替换了 app.asar，就破坏了原有签名，
+#   系统会拒绝启动：提示"应用已损坏，无法打开"（Apple Silicon 上更可能直接启动失败）。
+#   解法是用 ad-hoc 临时签名（codesign --sign -）重签一遍，无需苹果开发者证书。
+#
+# 为什么必须保留 entitlements：
+#   Electron 运行时需要 JIT 等特殊权限，这些权限记录在 entitlements.plist 里。
+#   如果直接裸签（不带 --entitlements），App 签名是有效的，但启动时会因缺少
+#   JIT 权限而崩溃。所以流程是：先把原包的 entitlements 导出，再用它重签。
+
+def _codesign_available():
+    return shutil.which("codesign") is not None
+
+
+def _mac_export_entitlements(app_bundle):
+    """导出原包的 entitlements 到临时 plist。失败返回 None（后续用通用兜底）。
+
+    注意两个真实存在的坑（都会导致"明明有权限却被丢弃"）：
+      1. macOS 12+ 必须加 --xml，否则输出的是人类可读摘要而非 plist；
+      2. Xcode 13.3+ 的 --xml 输出末尾会多一个 NUL(\\x00) 字节，
+         它会让 plutil -lint 判定失败，必须先剥掉。
+    """
+    tmp_plist = os.path.join(tempfile.gettempdir(),
+                             f"agy_zh_entitlements_{os.getpid()}.plist")
+    try:
+        r = subprocess.run(["codesign", "-d", "--entitlements", "-", "--xml", app_bundle],
+                           capture_output=True, timeout=60)
+        raw = r.stderr or b""
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8", "replace")
+        # 坑2：剥掉尾部 NUL 与空白
+        raw = raw.rstrip(b"\x00").rstrip()
+        text = raw.decode("utf-8", "replace")
+        if "<plist" not in text:
+            return None
+        # codesign 可能在 plist 之前打印 "Executable=..." 等信息，从 <?xml 或 <plist 起截取
+        if "<?xml" in text:
+            start = text.index("<?xml")
+        else:
+            start = text.index("<plist")
+        body = text[start:]
+
+        with open(tmp_plist, "w", encoding="utf-8", newline="") as f:
+            f.write(body)
+        # 用 plutil 校验合法性（陷阱：--lint 成功才算过）
+        v = subprocess.run(["plutil", "-lint", tmp_plist], capture_output=True, text=True)
+        if v.returncode != 0:
+            # 兜底再试一次：让 plutil 直接把 stdin 转成标准 plist 后落盘
+            try:
+                p2 = subprocess.run(["plutil", "-convert", "xml1", "-o", "-", "-"],
+                                    input=body.encode("utf-8"),
+                                    capture_output=True, timeout=30)
+                if p2.returncode == 0 and b"<plist" in (p2.stdout or b""):
+                    with open(tmp_plist, "wb") as f:
+                        f.write(p2.stdout.rstrip(b"\x00").rstrip())
+                    return tmp_plist
+            except Exception:
+                pass
+            os.remove(tmp_plist)
+            return None
+        return tmp_plist
+    except Exception:
+        if os.path.exists(tmp_plist):
+            try:
+                os.remove(tmp_plist)
+            except OSError:
+                pass
+        return None
+
+
+def _mac_verify_signature(app_bundle):
+    """校验当前签名是否有效。返回 (是否有效, 说明)"""
+    try:
+        r = subprocess.run(["codesign", "--verify", "--deep", "--strict", app_bundle],
+                           capture_output=True, text=True, encoding='utf-8', errors='replace',
+                           timeout=120)
+        if r.returncode == 0:
+            return True, "签名有效"
+        return False, _zh_error(r.stderr or r.stdout)
+    except Exception as e:
+        return False, f"校验异常：{e}"
+
+
+# ----------------------------------------------------------------------------
+# 代码签名身份（designated requirement）
+# ----------------------------------------------------------------------------
+# 这是 Mac 端「汉化后还能不能更新」的唯一开关，改动前务必读完这段。
+#
+# 机制：
+#   Squirrel.Mac（Electron 的 macOS 更新组件）在安装更新前，会先取**当前正在
+#   运行的这个 app** 的 designated requirement（DR，代码身份），再用它去校验
+#   下载回来的新包；新包必须满足这条 DR，否则直接拒绝安装。
+#
+#   默认情况下，`codesign --force --sign -`（ad-hoc 临时签名）生成的 DR 是
+#   `cdhash H"..."` —— 也就是「只认这一个人二进制文件的哈希」。
+#   官方新版的哈希必然不同，所以 ad-hoc 重签过的 app **永远不可能**通过官方的
+#   应用内自动更新。这不是脚本写错，是签名机制本身决定的。
+#
+# 解法：
+#   重签时用 `--requirements` 显式写入一条只锚定 bundle id 的 DR：
+#       designated => identifier "com.google.antigravity"
+#   这样当前 app 满足自己（identifier 一致，codesign --verify 仍通过），
+#   官方新版（Google 签名）也满足（identifier 一致），Squirrel 就会放行。
+#
+# 代价（必须如实告知用户）：
+#   DR 不再校验发布者证书，只校验 bundle id。安全性由更新通道的 HTTPS 与
+#   sha512 校验承担。这比 cdhash 宽，但仍然只接受「同一个应用」。
+#
+# 兼容性：
+#   旧版 macOS 或异常环境下 `--requirements` 可能不被接受。因此调用方必须
+#   准备好「写入失败 → 回退普通重签」的降级路径，并在重签后回读 DR 确认。
+
+def _mac_bundle_identifier(app_bundle):
+    """读取 .app 的 CFBundleIdentifier。失败返回 None。
+    优先用 plutil（系统自带，最可靠），再用 plistlib 兜底。"""
+    plist = os.path.join(app_bundle, "Contents", "Info.plist")
+    if not os.path.isfile(plist):
+        return None
+    try:
+        r = subprocess.run(["plutil", "-extract", "CFBundleIdentifier", "raw", "-o", "-", plist],
+                           capture_output=True, text=True, encoding='utf-8',
+                           errors='replace', timeout=30)
+        if r.returncode == 0:
+            bid = (r.stdout or "").strip()
+            if re.fullmatch(r"[A-Za-z0-9._-]{1,200}", bid):
+                return bid
+    except Exception:
+        pass
+    try:
+        import plistlib
+        with open(plist, "rb") as f:
+            d = plistlib.load(f)
+        bid = str(d.get("CFBundleIdentifier") or "").strip()
+        if re.fullmatch(r"[A-Za-z0-9._-]{1,200}", bid):
+            return bid
+    except Exception:
+        pass
+    return None
+
+
+def _mac_signing_identifier(app_bundle):
+    """读取「当前签名」里的 Identifier（codesign -d --verbose=4 的 Identifier= 行）。
+    必须在重签**之前**调用：重签后读到的就是新签名的标识了。
+
+    为什么优先用它而不是 Info.plist 的 CFBundleIdentifier：
+    两者通常相同，但官方若显式指定过 --identifier，就可能不同；
+    用签名里的真实标识才能保证 DR 同时匹配「当前 app」和「官方新包」。"""
+    try:
+        r = subprocess.run(["codesign", "-d", "--verbose=4", app_bundle],
+                           capture_output=True, text=True, encoding='utf-8',
+                           errors='replace', timeout=60)
+        text = (r.stderr or "") + (r.stdout or "")
+        mm = re.search(r"^Identifier=(.+)$", text, re.M)
+        if mm:
+            val = mm.group(1).strip()
+            if re.fullmatch(r"[A-Za-z0-9._-]{1,200}", val):
+                return val
+    except Exception:
+        pass
+    return None
+
+
+def _mac_update_friendly_requirement(app_bundle):
+    """构造稳定 DR（只锚定签名 identifier），返回 codesign -r 的字面量参数。
+    拿不到标识时返回 None（调用方回退普通重签）。"""
+    ident = _mac_signing_identifier(app_bundle) or _mac_bundle_identifier(app_bundle)
+    if not ident:
+        return None
+    # 只允许安全字符，避免 requirement 语法被畸形标识破坏
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,200}", ident):
+        return None
+    return f'=designated => identifier "{ident}"'
+
+
+def _mac_read_designated_requirement(app_bundle):
+    """回读当前签名里的 designated requirement 文本。
+    codesign 把 DR 打到 stderr；失败返回空串。"""
+    try:
+        r = subprocess.run(["codesign", "-d", "-r-", app_bundle],
+                           capture_output=True, text=True, encoding='utf-8',
+                           errors='replace', timeout=60)
+        return ((r.stderr or "") + (r.stdout or "")).strip()
+    except Exception:
+        return ""
+
+
+def _mac_dr_line(dr_text):
+    """从 `codesign -d -r-` 的输出里取出 designated requirement 那一行。
+
+    为什么单独抽出来：codesign 的输出里还会有 Executable= / Identifier= /
+    Format= 等行，直接拿最后一行或整体字符串判断都可能误判。
+    只认以 `designated =>` 开头的行；没有这一行就返回空（视为「没有可用身份」）。"""
+    for ln in (dr_text or "").splitlines():
+        s = ln.strip()
+        if s.startswith("designated =>"):
+            return s
+    return ""
+
+
+def _mac_dr_is_stable(dr_text):
+    """DR 是否已经摆脱 cdhash 锚定（即「跨版本稳定」）。
+    只看 designated 那一行；ad-hoc 默认生成的 DR 一定含 cdhash。"""
+    line = _mac_dr_line(dr_text).lower()
+    if not line:
+        return False
+    return "cdhash" not in line
+
+
+def _mac_nested_code_items(app_bundle):
+    """枚举 .app 内需要签名的嵌套代码（framework / helper app / dylib / 插件）。
+
+    Apple 明确要求：嵌套代码应逐个签名，且**不能带 entitlements**
+    （官方文档：不要在签 framework 时包含授权，包含它们会产生无效签名）。
+    返回按"由内到外"排序的路径列表。"""
+    items = []
+    fw = os.path.join(app_bundle, "Contents", "Frameworks")
+    if os.path.isdir(fw):
+        try:
+            for name in sorted(os.listdir(fw)):
+                p = os.path.join(fw, name)
+                if name.endswith(".framework"):
+                    # framework 必须签 Versions/<具体版本>，不能签顶层（符号链接）
+                    vers = os.path.join(p, "Versions")
+                    if os.path.isdir(vers):
+                        subs = [d for d in sorted(os.listdir(vers))
+                                if d != "Current"]
+                        if subs:
+                            for s in subs:
+                                items.append(os.path.join(vers, s))
+                        else:
+                            items.append(p)
+                    else:
+                        items.append(p)
+                elif name.endswith((".app", ".dylib", ".node", ".so")):
+                    items.append(p)
+                elif os.path.isdir(p) and not name.endswith(".lproj"):
+                    items.append(p)
+        except OSError:
+            pass
+    # 顶层 PlugIns / XPCServices / Helpers 里的 appex 与 helper app
+    for sub in ("PlugIns", "XPCServices", "Helpers"):
+        d = os.path.join(app_bundle, "Contents", sub)
+        if not os.path.isdir(d):
+            continue
+        try:
+            for name in sorted(os.listdir(d)):
+                p = os.path.join(d, name)
+                if os.path.isdir(p) and name.endswith((".app", ".appex")):
+                    items.append(p)
+        except OSError:
+            pass
+    # 深度优先：层级更深（内层）的先签，保证"由内到外"
+    items = sorted(set(items), key=lambda x: (-x.count(os.sep), x))
+    return items
+
+
+def _mac_sign_once(target, identity="-", entitlements=None, sudo=False,
+                   verbose=False, requirements=None):
+    """执行一次 codesign。sudo=True 时走 osascript 弹窗授权。
+    返回 (是否成功, 输出信息)。全程参数列表形式，无 shell 拼接。
+
+    requirements: 传给 codesign -r 的字面量（以 = 开头）。仅用于主包，
+    用来写入稳定的 designated requirement，保证官方应用内更新不被拒。
+
+    sudo 路径的实现要点（这里刻意不用字符串拼接 + eval）：
+      把完整命令写进临时 .sh 脚本，osascript 只执行
+      `do shell script "/bin/bash <脚本路径>" with administrator privileges`。
+      这样应用路径完全不进入 AppleScript 字符串，
+      也就绕开了 AppleScript 与 POSIX 两层转义的坑——
+      含空格、单引号、$ 等特殊字符的路径都能正确执行。
+    """
+    cmd = ["codesign", "--force", "--sign", identity]
+    if requirements:
+        cmd += ["--requirements", requirements]
+    if entitlements:
+        cmd += ["--entitlements", entitlements]
+    if verbose:
+        cmd.append("--verbose")
+    cmd.append(target)
+
+    # 路径含控制字符时无法安全写入单行脚本，直接拒绝（macOS 上极罕见）
+    for c in cmd:
+        if _has_control_chars(c):
+            return False, f"路径含控制字符，已拒绝执行：{c!r}"
+
+    if sudo:
+        return _mac_sign_via_admin(cmd)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding='utf-8', errors='replace', timeout=900)
+    except subprocess.TimeoutExpired:
+        return False, "签名超时"
+    except (FileNotFoundError, PermissionError, OSError) as e:
+        # 命令不存在 / 无权限 / 其他系统错误：返回可读原因，不让脚本崩掉
+        return False, f"无法执行 codesign：{e}"
+    if r.returncode != 0:
+        return False, _zh_error(r.stderr or r.stdout)
+    return True, ""
+
+
+def _mac_sign_via_admin(cmd):
+    """通过系统密码框以管理员权限执行 codesign。
+    做法：命令落盘成临时 shell 脚本，osascript 只执行脚本路径。
+    路径不进入 AppleScript 字符串，因此不存在转义/注入风险。"""
+    ok = _mac_run_admin(cmd)
+    if ok:
+        return True, ""
+    return False, "管理员授权失败或用户取消了密码输入"
+
+
+def _mac_cleanup(ent):
+    if ent:
+        try:
+            os.remove(ent)
+        except OSError:
+            pass
+
+
+def _mac_cleanup_stale_temp():
+    """清理历史遗留的临时文件（上次运行被强杀/中断时的残留）。
+    这些文件带 PID，放在系统临时目录里长期累积不干净。"""
+    import glob
+    import time as _t
+    tmp = tempfile.gettempdir()
+    cutoff = _t.time() - 3600          # 只清理 1 小时前的，避免误删并发运行的
+    for pat in ("agy_zh_entitlements_*.plist", "agy_zh_ent_default_*.plist",
+                "agy_zh_sign_*.sh", "agy_zh_admin_*.sh"):
+        for p in glob.glob(os.path.join(tmp, pat)):
+            try:
+                if os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+            except OSError:
+                pass
+
+
+def _mac_resign(app_bundle, use_sudo=True, auto_yes=False):
+    """执行重签。采用 Apple 推荐方式：内层组件裸签 -> 外层主包带 entitlements 签。
+    返回 True 表示签名最终有效。
+
+    为什么不用 `codesign --deep --entitlements ...` 一把梭：
+      Apple 官方明确反对 --deep（"Considered Harmful"），因为它把同一份签名选项
+      套用到每个嵌套代码项。Electron 的 Helper 进程与主程序权限需求不同
+      （Helper 应继承沙盒而非声明 JIT 等主进程权限），混签会生成无效签名，
+      表现为 codesign 校验通过但 App 启动即崩。
+    """
+    if not _codesign_available():
+        log("未找到 codesign 命令（需安装 Xcode 命令行工具：xcode-select --install）", warn=True)
+        return False
+
+    # 清理历史残留（上次运行被中断时留下的）
+    _mac_cleanup_stale_temp()
+
+    # 1) 清扩展属性（quarantine / 资源分叉等，它们会独立导致"已损坏"）
+    try:
+        subprocess.run(["xattr", "-cr", app_bundle], capture_output=True, timeout=300)
+    except Exception:
+        pass
+
+    # 2) 导出原 entitlements（保留 Electron 必需的 JIT 等权限）
+    ent = _mac_export_entitlements(app_bundle)
+    if ent:
+        log("已导出原包权限清单（entitlements），重签时将保留", ok=True)
+    else:
+        ent = _write_default_entitlements()
+        if ent:
+            log("未能导出原包 entitlements，改用通用 Electron 权限重签", warn=True)
+        else:
+            log("无法准备 entitlements 文件，将裸签（可能影响启动）", warn=True)
+
+    # 从这里开始，无论成功失败甚至被 Ctrl+C 中断，都必须清理临时文件
+    try:
+        return _mac_resign_inner(app_bundle, ent, use_sudo)
+    finally:
+        _mac_cleanup(ent)
+
+
+def _mac_resign_inner(app_bundle, ent, use_sudo):
+    """实际签名流程（由 _mac_resign 包装，确保临时文件一定被清理）"""
+    # 3) 先签所有嵌套代码——不带 entitlements（Apple 明确要求）
+    nested = _mac_nested_code_items(app_bundle)
+    if nested:
+        log(f"正在签名 {len(nested)} 个嵌套组件（不带权限清单）...")
+    failed_nested = []
+    for item in nested:
+        ok, err = _mac_sign_once(item, "-", None, sudo=False)
+        if not ok:
+            ok2, err2 = _mac_sign_once(item, "-", None, sudo=use_sudo and IS_MAC)
+            if not ok2:
+                failed_nested.append((os.path.basename(item), err2 or err))
+    if failed_nested:
+        log(f"{len(failed_nested)} 个嵌套组件签名失败："
+            + ", ".join(n for n, _ in failed_nested[:3]), warn=True)
+    elif nested:
+        log("嵌套组件签名完成", ok=True)
+
+    # 4) 最后签主包（带 entitlements + 稳定签名要求）
+    #    -r 写入「只锚定签名标识」的 designated requirement，
+    #    否则 ad-hoc 默认生成 cdhash 锚定的身份，官方应用内更新必然被拒。
+    dr = _mac_update_friendly_requirement(app_bundle)
+    log("正在签名主应用包（带权限清单）...")
+
+    # 4a) 先试普通权限。绝大多数情况下 /Applications 已有写权限。
+    ok, err = _mac_sign_once(app_bundle, "-", ent, sudo=False, requirements=dr)
+
+    # 4b) 失败 → 先判断是不是权限问题，**保持 DR** 走管理员重试。
+    #     这里不能先回退：一旦把 dr 置空，sudo 重试就不带稳定身份了，
+    #     结果是「签名成功但更新能力被静默丢掉」。
+    if not ok and use_sudo and IS_MAC:
+        log("需要管理员权限，正在弹出系统密码框...", warn=True)
+        ok, err = _mac_sign_once(app_bundle, "-", ent, sudo=True, requirements=dr)
+
+    # 4c) 带 DR 仍然失败，才判定为「系统不接受 --requirements」，回退普通重签。
+    if not ok and dr:
+        log(f"稳定签名要求写入失败，回退普通重签（应用内更新将不可用）：{err}", warn=True)
+        dr = None
+        ok, err = _mac_sign_once(app_bundle, "-", ent, sudo=use_sudo and IS_MAC)
+
+    if not ok:
+        log(f"主包签名失败：{err}", warn=True)
+        return False
+
+    # 4d) 校验（--deep 在校验场景下是官方认可的用法）
+    valid, msg = _mac_verify_signature(app_bundle)
+    if not valid and use_sudo and IS_MAC:
+        ok2, _ = _mac_sign_once(app_bundle, "-", ent, sudo=True, requirements=dr)
+        if ok2:
+            valid, msg = _mac_verify_signature(app_bundle)
+        if not valid and dr:
+            # 带稳定身份仍校验不过：以「能打开」为最高优先级，退回普通重签
+            log("带稳定签名要求仍校验失败，回退普通重签", warn=True)
+            ok3, _ = _mac_sign_once(app_bundle, "-", ent, sudo=True)
+            if ok3:
+                dr = None
+                valid, msg = _mac_verify_signature(app_bundle)
+
+    # 4e) 回读签名身份（放在最终签名之后，避免报告过期状态）
+    dr_text = _mac_read_designated_requirement(app_bundle)
+    dr_line = _mac_dr_line(dr_text)
+    if _mac_dr_is_stable(dr_text):
+        log("签名身份已固定为 bundle id（官方应用内自动更新可用）", ok=True)
+        if dr_line:
+            log(f"  当前签名身份：{dr_line[:160]}")
+    else:
+        log("签名身份仍是 ad-hoc 单版本锚定（cdhash）——"
+            "官方应用内自动更新会被拒绝，这是可预期的降级", warn=True)
+        if dr_line:
+            log(f"  当前签名身份：{dr_line[:160]}", warn=True)
+
+    # 临时文件清理由外层 _mac_resign 的 finally 统一负责
+    if valid:
+        log("代码签名重签完成并校验通过", ok=True)
+        return True
+    log(f"重签后校验未通过：{msg}", warn=True)
+    return False
+
+
+def _shquote(s):
+    """单引号转义，供写入 shell 脚本使用（POSIX 规则）。
+    注意：仅在"写入脚本文件后由 bash 直接解析"的场景下有效，
+    不可用于 eval（eval 会二次解析导致转义失效）。"""
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+
+def _has_control_chars(s):
+    """路径是否含控制字符（换行/NUL/制表符等）。
+    这类字符无法安全地写入单行 shell 脚本，遇到时直接拒绝而非冒险执行。"""
+    return any(ord(c) < 32 or ord(c) == 127 for c in str(s))
+
+
+# macOS 系统命令的报错是英文，这里做常见错误的中文化。
+# 未收录的原文保留（便于用户搜索或反馈），前面加「系统提示：」以示区分。
+_CODESIGN_ERRORS = [
+    ("Permission denied", "权限不足，请重试并输入 Mac 密码"),
+    ("Operation not permitted", "权限不足（系统禁止该操作），请确认已允许修改"),
+    ("No such file or directory", "文件或目录不存在"),
+    ("code object is not signed at all", "目标未被签名（这是正常状态，重签即可）"),
+    ("invalid signature", "签名无效"),
+    ("signature is invalid", "签名无效"),
+    ("bundle format unrecognized, invalid, or unsuitable",
+     "应用包格式无法识别（可能不是 Antigravity.app）"),
+    ("resource fork, Finder information, or similar detritus not allowed",
+     "存在资源分叉或 Finder 附加信息，请先执行：xattr -cr <应用路径>"),
+    ("Command line tool invalid", "签名参数无效"),
+    ("invalid or unsupported format for signature", "签名格式不受支持"),
+    ("The signature was invalidated", "签名已失效"),
+    ("Unable to open", "无法打开目标文件"),
+    ("No such directory", "目录不存在"),
+]
+
+
+def _zh_error(raw, limit=300):
+    """把系统英文报错转为可读中文；未收录则保留原文并标注来源。"""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    low = s.lower()
+    for needle, zh in _CODESIGN_ERRORS:
+        if needle.lower() in low:
+            extra = ""
+            # 保留关键英文关键词，方便用户自行搜索
+            if needle == "resource fork, Finder information, or similar detritus not allowed":
+                extra = ""
+            return f"{zh}（系统原文：{s[:limit]}）" if len(s) < 40 else f"{zh}（{s[:limit]}）"
+    return f"系统提示：{s[:limit]}"
+
+
+_DEFAULT_ENTITLEMENTS = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.allow-jit</key><true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+  <key>com.apple.security.cs.allow-dyld-environment-variables</key><true/>
+  <key>com.apple.security.cs.disable-library-validation</key><true/>
+  <key>com.apple.security.inherit</key><true/>
+</dict>
+</plist>
+"""
+
+
+def _write_default_entitlements():
+    """兜底 entitlements：Electron 运行时必需的 JIT 等权限"""
+    p = os.path.join(tempfile.gettempdir(), f"agy_zh_ent_default_{os.getpid()}.plist")
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(_DEFAULT_ENTITLEMENTS)
+        return p
+    except OSError:
+        return None
+
+
+def mac_post_deploy(resources_dir, auto_yes=False):
+    """部署完成后调用：清除扩展属性 + 重签 + 校验。
+    Windows 下此函数不做任何事（直接返回）。"""
+    if not IS_MAC:
+        return True
+    bundle = find_app_bundle(resources_dir)
+    if not bundle:
+        log("未能定位 .app 包，跳过签名步骤（不影响汉化内容）", warn=True)
+        return True
+    log(f"macOS 签名处理：{bundle}", ok=True)
+    ok, msg = _mac_verify_signature(bundle)
+    if ok:
+        log(f"当前签名状态：{msg}", ok=True)
+    else:
+        log(f"签名已因改动 app.asar 而失效（预期内）：{msg}", warn=True)
+    return _mac_resign(bundle, use_sudo=True, auto_yes=auto_yes)
+
+
+def _mac_run_admin(argv, timeout=900):
+    """以管理员权限执行一个命令（参数列表）。
+    做法：命令落盘成临时 shell 脚本，osascript 只执行脚本路径——
+    应用路径不进入 AppleScript 字符串，绕开两层转义。
+    返回 True 表示执行成功。"""
+    if _has_control_chars(" ".join(str(a) for a in argv)):
+        return False
+    body = "#!/bin/bash\n" + " ".join(_shquote(x) for x in argv) + "\n"
+    sh_path = os.path.join(tempfile.gettempdir(),
+                           f"agy_zh_admin_{os.getpid()}_{int(time.time() * 1000) % 100000}.sh")
+    try:
+        with open(sh_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(body)
+        os.chmod(sh_path, 0o755)
+    except OSError:
+        return False
+    try:
+        osa = ('do shell script "/bin/bash \'%s\'" with administrator privileges'
+               % sh_path)
+        r = subprocess.run(["osascript", "-e", osa], capture_output=True, text=True,
+                           encoding='utf-8', errors='replace', timeout=timeout)
+        return r.returncode == 0
+    except Exception:
+        return False
+    finally:
+        try:
+            os.remove(sh_path)
+        except OSError:
+            pass
+
+
+def _mac_replace_with_admin(src, dst):
+    """用管理员权限把 src 覆盖到 dst（同一卷内仍保持原子替换语义）。"""
+    if not IS_MAC:
+        return False
+    if not os.path.isfile(src):
+        return False
+    return _mac_run_admin(["mv", "-f", src, dst])
+
+
+def mac_status_extra(resources_dir):
+    """macOS 状态检查追加项：签名健康度 + 更新能力"""
+    if not IS_MAC:
+        return
+    # 没装 codesign 时后面所有检查都会失败，先给一条准确的提示，
+    # 避免用户把「工具缺失」误读成「汉化坏了」。
+    if not _codesign_available():
+        log("代码签名：无法检查（未安装 codesign，请执行 xcode-select --install）", warn=True)
+        return
+    bundle = find_app_bundle(resources_dir)
+    if not bundle:
+        return
+    ok, msg = _mac_verify_signature(bundle)
+    if ok:
+        log("代码签名：有效", ok=True)
+    else:
+        log(f"代码签名：已失效（{msg}）", warn=True)
+        log("  修复：选 1 重新汉化，或运行同目录下的「修复签名.command」。", warn=True)
+    # 签名身份决定「官方应用内更新」能不能用，单独报一行
+    dr_text = _mac_read_designated_requirement(bundle)
+    if not dr_text:
+        log("更新能力：无法读取签名身份（建议重新汉化一次）", warn=True)
+    elif _mac_dr_is_stable(dr_text):
+        log("更新能力：官方应用内自动更新可用（签名身份已固定）", ok=True)
+    else:
+        log("更新能力：官方应用内自动更新不可用（签名身份为单版本哈希）", warn=True)
+        log("  原因：ad-hoc 签名默认把身份锚定在当前二进制哈希上，"
+            "官方新版哈希不同 → Squirrel 拒绝安装。", warn=True)
+        log("  处理：重新运行一次汉化（v1.15+ 会写入稳定身份）；"
+            "若仍不行，请从官网下载新版覆盖安装后再汉化。", warn=True)
+
+
+_FIX_SH = r"""#!/bin/bash
+# ============================================================
+# Antigravity 一键汉化 · macOS 签名修复脚本
+# ------------------------------------------------------------
+# 什么时候需要用它：
+#   汉化完成后若双击 Antigravity 提示「应用已损坏，无法打开」，
+#   说明 app.asar 被改动后代码签名失效了。运行本脚本重新签名即可。
+#
+# 用法：双击本文件 → 输入 Mac 密码 → 等待完成
+# ============================================================
+
+APP="__APP_BUNDLE__"
+
+if [ ! -d "$APP" ]; then
+  echo "[错误] 找不到应用包：$APP"
+  echo "请确认 Antigravity 已安装在 /Applications 下。"
+  read -r -p "按回车键关闭..." _
+  exit 1
+fi
+
+echo ""
+echo "=============================================================="
+echo "  Antigravity 签名修复"
+echo "  应用路径：$APP"
+echo "=============================================================="
+echo ""
+
+# ---- 1. 请关闭 Antigravity ----
+if pgrep -f "$APP/Contents/MacOS" >/dev/null 2>&1; then
+  echo "[!] 检测到 Antigravity 正在运行，将先关闭它。"
+  osascript -e 'quit app "Antigravity"' >/dev/null 2>&1
+  sleep 2
+  pkill -f "$APP/Contents/MacOS" 2>/dev/null
+  sleep 1
+fi
+
+# ---- 2. 清除扩展属性（quarantine 会独立导致"已损坏"）----
+echo "[1/4] 清除扩展属性..."
+xattr -cr "$APP" 2>/dev/null
+
+# ---- 3. 导出原包 entitlements（Electron 运行时必需）----
+echo "[2/4] 导出原包权限清单..."
+ENT="$(mktemp -t agy_ent).plist"
+if codesign -d --entitlements - --xml "$APP" 2>&1 | tr -d '\000' | sed -n '/<?xml/,/<\/plist>/p' > "$ENT" \
+   && [ -s "$ENT" ] && plutil -lint "$ENT" >/dev/null 2>&1; then
+  echo "      已保留原包权限清单"
+else
+  cat > "$ENT" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.allow-jit</key><true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+  <key>com.apple.security.cs.allow-dyld-environment-variables</key><true/>
+  <key>com.apple.security.cs.disable-library-validation</key><true/>
+  <key>com.apple.security.inherit</key><true/>
+</dict>
+</plist>
+PLIST
+  echo "      原包无可用清单，改用通用 Electron 权限"
+fi
+
+# ---- 4. 分层签名：先签嵌套组件（不带 entitlements），最后签主包（带）----
+# Apple 要求：framework 等嵌套代码逐个签名且不得携带 entitlements
+echo "[3/4] 重新签名（如提示权限不足，请输入 Mac 密码）..."
+FAIL=0
+if [ -d "$APP/Contents/Frameworks" ]; then
+  for item in "$APP/Contents/Frameworks"/*.framework; do
+    [ -e "$item" ] || continue
+    if [ -d "$item/Versions" ]; then
+      for v in "$item/Versions"/*; do
+        [ -e "$v" ] || continue
+        [ "$(basename "$v")" = "Current" ] && continue
+        codesign --force --sign - "$v" 2>/dev/null || FAIL=$((FAIL+1))
+      done
+    else
+      codesign --force --sign - "$item" 2>/dev/null || FAIL=$((FAIL+1))
+    fi
+  done
+  for item in "$APP/Contents/Frameworks"/*.app "$APP/Contents/Frameworks"/*.dylib; do
+    [ -e "$item" ] || continue
+    codesign --force --sign - "$item" 2>/dev/null || FAIL=$((FAIL+1))
+  done
+fi
+
+# 主包：优先写入「只锚定 bundle id」的签名身份，让官方应用内更新不被拒绝；
+# 写入失败则回退普通重签（App 能打开优先于能更新）
+BID="$(plutil -extract CFBundleIdentifier raw -o - "$APP/Contents/Info.plist" 2>/dev/null)"
+SIGN_OK=0
+if [ -n "$BID" ]; then
+  if codesign --force --sign - --requirements "=designated => identifier \"$BID\"" \
+       --entitlements "$ENT" "$APP" 2>/dev/null; then
+    SIGN_OK=1
+  fi
+fi
+if [ "$SIGN_OK" -eq 0 ]; then
+  codesign --force --sign - --entitlements "$ENT" "$APP" || FAIL=$((FAIL+1))
+fi
+
+# ---- 5. 校验 ----
+# 注意：$ENT 必须留到校验之后。带稳定身份签完若校验不过，
+# 还要用它回退普通重签；提前删掉会让回退变成裸签。
+echo "[4/4] 校验签名..."
+VERIFY_OK=0
+if codesign --verify --deep --strict "$APP" 2>/dev/null; then
+  VERIFY_OK=1
+elif [ "$SIGN_OK" -eq 1 ]; then
+  echo "  [!] 带稳定身份校验未通过，回退普通重签..."
+  if codesign --force --sign - --entitlements "$ENT" "$APP" 2>/dev/null \
+     && codesign --verify --deep --strict "$APP" 2>/dev/null; then
+    VERIFY_OK=1
+  fi
+fi
+rm -f "$ENT"
+
+if [ "$VERIFY_OK" -eq 1 ]; then
+  DR="$(codesign -d -r- "$APP" 2>&1 | tr -d '\000')"
+  echo ""
+  echo "=============================================================="
+  echo "  修复成功！现在可以正常打开 Antigravity 了。"
+  case "$DR" in
+    *cdhash*)
+      echo "  注意：签名身份为单版本哈希，官方「应用内自动更新」会被拒绝。"
+      echo "        更新请从官网下载新版覆盖安装，再重新汉化。"
+      ;;
+    *)
+      echo "  签名身份已固定，官方「应用内自动更新」可用。"
+      echo "        （更新后界面会变回英文，重新汉化即可）"
+      ;;
+  esac
+  echo "=============================================================="
+  echo ""
+  open "$APP" 2>/dev/null
+  read -r -p "按回车键关闭窗口..." _
+  exit 0
+else
+  echo ""
+  echo "  [!] 签名校验仍未通过。"
+  echo "      请先重新运行一次「一键汉化」——它会重新导出原包权限清单再签，"
+  echo "      比手动裸签安全（裸签会丢 entitlements，App 可能启动即崩）。"
+  echo "      若仍失败，可打开「终端」手动执行排查："
+  echo "      sudo xattr -cr \"$APP\""
+  echo "      codesign -d --entitlements - --xml \"$APP\"   # 确认权限清单是否还在"
+  echo ""
+  read -r -p "按回车键关闭窗口..." _
+  exit 1
+fi
+"""
+
+
+def _mac_write_fix_script(resources_dir):
+    """生成「修复签名.command」到脚本所在目录，返回路径（失败返回 None）。
+    用占位符替换而非 str.format，避免 shell 脚本里的 { } 引发 KeyError。"""
+    bundle = find_app_bundle(resources_dir)
+    if not bundle:
+        return None
+    if _has_control_chars(bundle):
+        log(f"应用路径含控制字符，无法生成修复脚本：{bundle!r}", warn=True)
+        return None
+    path = os.path.join(SCRIPT_DIR, "修复签名.command")
+    try:
+        # 防注入：应用路径里的引号在 bash 双引号中需转义
+        safe = bundle.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(_FIX_SH.replace("__APP_BUNDLE__", safe))
+        os.chmod(path, 0o755)
+        return path
+    except OSError as e:
+        log(f"生成修复脚本失败：{e}", warn=True)
+        return None
+
+
+# ----------------------------------------------------------------------------
+# 注入逻辑（全部幂等：先剥离旧注入/还原锚点，再重新注入）
+# ----------------------------------------------------------------------------
+def strip_block(content, start_marker, end_marker):
+    """移除标记之间的注入块（含标记行）"""
+    if start_marker not in content:
+        return content
+    s = content.index(start_marker)
+    e = content.find(end_marker, s)
+    if e == -1:  # 有头无尾（异常态）：删到文件尾
+        return content[:s]
+    e += len(end_marker)
+    # 吃掉尾部换行
+    while e < len(content) and content[e] in "\r\n":
+        e += 1
+    return content[:s] + content[e:]
+
+
+def revert_replaces(content, pairs):
+    """把锚点替换还原为官方原文（幂等重入的关键）"""
+    for hooked, original in pairs:
+        if hooked in content:
+            content = content.replace(hooked, original)
+    return content
+
+
+def apply_anchor_replace(content, find, replace, label, report):
+    """锚点替换：原文在→替换；替换结果已在→跳过；都不在→记录未命中"""
+    if find in content:
+        report.append(("替换", label, True))
+        return content.replace(find, replace)
+    probe = replace if len(replace) < 200 else replace[:200]
+    if probe in content:
+        report.append(("已生效", label, True))
+        return content
+    report.append(("未命中", label, False))
+    return content
+
+
+def inject_engine(content, engine_code, data_json):
+    """把引擎追加到 preload 类文件末尾"""
+    content = strip_block(content, ENGINE_START, ENGINE_END)
+    block = (f"\n{ENGINE_START}\n"
+             f"// 由 localize.py 于部署时生成，词典已内联。恢复英文请运行 restore。\n"
+             f"{engine_code}\n"
+             f"{ENGINE_END}\n")
+    return content.rstrip("\n") + "\n" + block
+
+
+def build_menu_block(data):
+    menu_map = data.get("menuMap", {})
+    return (f"\n{MENU_START}\n"
+            f"const __AGY_ZH_MENU_MAP__ = {json.dumps(menu_map, ensure_ascii=False)};\n"
+            f"function __AGY_ZH_MENU_TRANSLATE__(mi) {{\n"
+            f"    if (mi && mi.label && __AGY_ZH_MENU_MAP__[mi.label]) {{\n"
+            f"        if (mi.__agyZhOrigLabel === undefined) mi.__agyZhOrigLabel = mi.label;\n"
+            f"        mi.label = __AGY_ZH_MENU_MAP__[mi.label];\n"
+            f"    }}\n"
+            f"    if (mi && mi.submenu) {{\n"
+            f"        if (mi.submenu.items) mi.submenu.items.forEach(__AGY_ZH_MENU_TRANSLATE__);\n"
+            f"        else if (Array.isArray(mi.submenu)) mi.submenu.forEach(__AGY_ZH_MENU_TRANSLATE__);\n"
+            f"    }}\n"
+            f"}}\n"
+            f"{MENU_END}\n")
+
+
+def build_tray_block():
+    return (f"\n{TRAY_START}\n"
+            f"function __AGY_ZH_TRAY_ACTIONS__(actions) {{\n"
+            f"    const M = {{ 'No agents running': '没有智能体在运行', 'Quit': '退出' }};\n"
+            f"    return actions.map(a => {{\n"
+            f"        if (a && a.label) {{\n"
+            f"            if (M[a.label]) a.label = M[a.label];\n"
+            f"            else if (/^Open /.test(a.label)) a.label = '打开 Antigravity';\n"
+            f"        }}\n"
+            f"        return a;\n"
+            f"    }});\n"
+            f"}}\n"
+            f"{TRAY_END}\n")
+
+
+# ----------------------------------------------------------------------------
+# 原生右键菜单（Electron Menu）
+# ----------------------------------------------------------------------------
+# 背景：Antigravity 2.31.x 的右键菜单走 `window.electronNative.showContextMenu(items)`
+# → 主进程 `Menu.buildFromTemplate` → OS 原生弹窗。它不产生任何 DOM 节点，
+# DOM 引擎（preload 里的 MutationObserver）根本看不到，所以整块菜单保持英文。
+# 2.31.2 实测：右键会话行后 DOM 中 .agy-overlay 数量为 0，而屏幕上确实弹出菜单，
+# 且菜单项无图标、快捷键右对齐 —— 与 renderer 侧 `xYa()` 把项目压成
+# {id,label,type,checked,disabled,accelerator}（**丢掉 icon**）后再 IPC 完全吻合。
+#
+# 修法：在 preload 暴露 `electronNative` 之前包一层，只翻译 label，
+# id / disabled / 点击回调 / 快捷键一律原样透传（主进程正是用 id 回传选中的项）。
+CTX_ORIG_EXPOSE = "electron_1.contextBridge.exposeInMainWorld('electronNative', electronNativeAPI);"
+CTX_HOOKED_EXPOSE = ("electron_1.contextBridge.exposeInMainWorld('electronNative', "
+                     "(typeof __AGY_ZH_WRAP_NATIVE__ === 'function' "
+                     "? __AGY_ZH_WRAP_NATIVE__(electronNativeAPI) : electronNativeAPI));")
+
+
+def build_ctxmenu_block():
+    # 注意：这里必须用 function 声明。注入块在文件末尾，而 expose 调用在文件前面，
+    # 只有声明才会被提升；写成 const/var 会在 expose 时拿到 undefined。
+    return f"""
+{CTX_START}
+// 把菜单项的 label 过一遍词典；失败一律返回原值，绝不让汉化弄坏右键菜单。
+function __AGY_ZH_CTX_LABEL__(label) {{
+    try {{
+        if (typeof window !== 'undefined' && typeof window.__AGY_ZH_MENU_LABEL__ === 'function') {{
+            var out = window.__AGY_ZH_MENU_LABEL__(label);
+            return typeof out === 'string' ? out : label;
+        }}
+    }} catch (e) {{ /* 翻译失败保留英文 */ }}
+    return label;
+}}
+// 深拷贝一层：只换 label，其余字段（含函数、React 元素、子菜单）原样保留。
+// 不原地改的原因：同一份 items 数组还可能被网页版菜单复用，改原对象会污染调用方。
+function __AGY_ZH_CTX_ITEMS__(items) {{
+    if (!Array.isArray(items)) return items;
+    var out = [];
+    for (var i = 0; i < items.length; i++) {{
+        var it = items[i];
+        if (!it || typeof it !== 'object') {{ out.push(it); continue; }}
+        var copy = {{}};
+        for (var k in it) {{
+            if (Object.prototype.hasOwnProperty.call(it, k)) copy[k] = it[k];
+        }}
+        if (typeof it.label === 'string' && it.label) copy.label = __AGY_ZH_CTX_LABEL__(it.label);
+        if (Array.isArray(it.items)) copy.items = __AGY_ZH_CTX_ITEMS__(it.items);
+        if (Array.isArray(it.submenu)) copy.submenu = __AGY_ZH_CTX_ITEMS__(it.submenu);
+        out.push(copy);
+    }}
+    return out;
+}}
+function __AGY_ZH_WRAP_NATIVE__(api) {{
+    try {{
+        if (!api || typeof api !== 'object' || typeof api.showContextMenu !== 'function') return api;
+        var wrapped = {{}};
+        for (var k in api) {{
+            if (Object.prototype.hasOwnProperty.call(api, k)) wrapped[k] = api[k];
+        }}
+        wrapped.showContextMenu = function (items) {{
+            var payload = items;
+            try {{ payload = __AGY_ZH_CTX_ITEMS__(items); }} catch (e) {{ payload = items; }}
+            return api.showContextMenu(payload);
+        }};
+        return wrapped;
+    }} catch (e) {{
+        return api;
+    }}
+}}
+{CTX_END}
+"""
+
+
+def patch_ctx_menu(path, report):
+    """给 preload 挂上原生右键菜单翻译钩子（幂等）"""
+    c = open(path, encoding='utf-8').read()
+    c = strip_block(c, CTX_START, CTX_END)
+    if CTX_HOOKED_EXPOSE in c:
+        report.append(("已生效", "preload.js 原生右键菜单挂钩", True))
+    elif CTX_ORIG_EXPOSE in c:
+        c = c.replace(CTX_ORIG_EXPOSE, CTX_HOOKED_EXPOSE)
+        report.append(("替换", "preload.js 原生右键菜单挂钩（electronNative 暴露点）", True))
+    else:
+        report.append(("未命中", "preload.js 原生右键菜单挂钩（官方结构变动，右键菜单可能保持英文）", False))
+    c = c.rstrip("\n") + "\n" + build_ctxmenu_block()
+    open(path, 'w', encoding='utf-8', newline='').write(c)
+
+
+
+# 菜单挂钩点（hooked → original 成对，用于幂等还原）
+def menu_hook_pairs():
+    set_hooked = ("{ if (typeof __AGY_ZH_MENU_TRANSLATE__ === 'function') "
+                  "{ try { menu.items.forEach(__AGY_ZH_MENU_TRANSLATE__); } catch (e) {} } "
+                  "electron_1.Menu.setApplicationMenu(menu); }")
+    set_orig = "electron_1.Menu.setApplicationMenu(menu);"
+    find_hooked = ("const submenuItem = appMenu.items.find((item) => item.label === submenuLabel || "
+                   "(typeof __AGY_ZH_MENU_MAP__ !== 'undefined' && item.label === __AGY_ZH_MENU_MAP__[submenuLabel]));")
+    find_orig = "const submenuItem = appMenu.items.find((item) => item.label === submenuLabel);"
+    tray_hooked = "electron_1.Menu.buildFromTemplate(__AGY_ZH_TRAY_ACTIONS__(actions));"
+    tray_orig = "electron_1.Menu.buildFromTemplate(actions);"
+    # 更新菜单项的点击处理用 menuItem.label 查动作表（updateActions 的键是英文枚举）。
+    # 标签被翻成中文后查不到 → 点击静默无效。加一条回退到原始英文标签。
+    upd_click_orig = "const action = updater_1.updateActions[menuItem.label];"
+    upd_click_hooked = ("const action = updater_1.updateActions[menuItem.label] || "
+                        "updater_1.updateActions[menuItem.__agyZhOrigLabel];")
+    return [(set_hooked, set_orig), (find_hooked, find_orig), (tray_hooked, tray_orig),
+            (upd_click_hooked, upd_click_orig)]
+
+
+def patch_all(extract_dir, engine_code, data, report):
+    """对解包目录执行全部注入，返回被修改文件列表"""
+    modified = []
+
+    def rd(p):
+        return open(p, encoding='utf-8').read()
+
+    def wr(p, s):
+        open(p, 'w', encoding='utf-8', newline='').write(s)
+        # 同一个文件可能被注入多次（menu.js 挂钩 + 子菜单 + 更新菜单；tray.js 挂钩 + 注入），
+        # 这里去重：对外报的应该是「被改动的文件数」，不是「写盘次数」。
+        if p not in modified:
+            modified.append(p)
+
+    data_json = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
+    # engine.js 中的占位符替换为真实词典
+    engine_final = engine_code.replace("/*__AGY_ZH_DATA__*/ {}",
+                                       "__AGY_ZH_DATA__JSON__").replace(
+                                           "__AGY_ZH_DATA__JSON__", data_json)
+
+    # ---- 1. dist/preload.js：DOM 翻译引擎 + 原生右键菜单 ----
+    p = os.path.join(extract_dir, "dist", "preload.js")
+    if os.path.isfile(p):
+        wr(p, inject_engine(rd(p), engine_final, data_json))
+        report.append(("注入", "dist/preload.js 界面翻译引擎", True))
+        # 引擎块之后追加右键菜单钩子；两者在同一文件，钩子里的函数声明会被提升，
+        # 所以 exposeInMainWorld 那行在文件更前面也能取到。
+        patch_ctx_menu(p, report)
+        if p not in modified:
+            modified.append(p)
+
+    # ---- 2. dist/ideInstall/wizardPreload.js：安装向导 ----
+    p = os.path.join(extract_dir, "dist", "ideInstall", "wizardPreload.js")
+    if os.path.isfile(p):
+        wr(p, inject_engine(rd(p), engine_final, data_json))
+        report.append(("注入", "dist/ideInstall/wizardPreload.js 向导翻译", True))
+
+    # ---- 3. dist/menu.js：原生菜单 ----
+    p = os.path.join(extract_dir, "dist", "menu.js")
+    if os.path.isfile(p):
+        c = rd(p)
+        c = strip_block(c, MENU_START, MENU_END)
+        c = revert_replaces(c, menu_hook_pairs())
+        # 先挂钩点，再追加定义（函数声明提升，使用点在前也安全）
+        set_hooked, set_orig = menu_hook_pairs()[0]
+        if set_orig in c:
+            c = c.replace(set_orig, set_hooked)
+            report.append(("替换", "menu.js 菜单注册挂钩（setApplicationMenu）", True))
+        elif set_hooked in c:
+            report.append(("已生效", "menu.js 菜单注册挂钩", True))
+        else:
+            report.append(("未命中", "menu.js 菜单注册挂钩（官方结构变动，菜单可能保持英文）", False))
+        find_hooked, find_orig = menu_hook_pairs()[1]
+        if find_orig in c:
+            c = c.replace(find_orig, find_hooked)
+            report.append(("替换", "menu.js 子菜单双语查找兼容", True))
+        elif find_hooked in c:
+            report.append(("已生效", "menu.js 子菜单双语查找", True))
+        else:
+            report.append(("未命中", "menu.js 子菜单双语查找", False))
+        # 更新菜单项点击：翻译后 label 变中文，updateActions 查不到 → 回退原始 label
+        upd_hooked, upd_orig = menu_hook_pairs()[3]
+        if upd_orig in c:
+            c = c.replace(upd_orig, upd_hooked)
+            report.append(("替换", "menu.js 更新菜单点击兼容翻译", True))
+        elif upd_hooked in c:
+            report.append(("已生效", "menu.js 更新菜单点击兼容", True))
+        else:
+            report.append(("未命中", "menu.js 更新菜单点击兼容（官方结构变动，菜单项可能失效）", False))
+        c = c.rstrip("\n") + "\n" + build_menu_block(data)
+        wr(p, c)
+        report.append(("注入", "dist/menu.js 菜单翻译映射", True))
+
+    # ---- 4. dist/tray.js：托盘 ----
+    p = os.path.join(extract_dir, "dist", "tray.js")
+    if os.path.isfile(p):
+        c = rd(p)
+        c = strip_block(c, TRAY_START, TRAY_END)
+        tray_hooked, tray_orig = menu_hook_pairs()[2]
+        if tray_orig in c:
+            c = c.replace(tray_orig, tray_hooked)
+            report.append(("替换", "tray.js 托盘菜单挂钩", True))
+        elif tray_hooked in c:
+            report.append(("已生效", "tray.js 托盘菜单挂钩", True))
+        else:
+            report.append(("未命中", "tray.js 托盘菜单挂钩", False))
+        c = c.rstrip("\n") + "\n" + build_tray_block()
+        wr(p, c)
+        report.append(("注入", "dist/tray.js 托盘翻译", True))
+
+    # ---- 5. 静态锚点替换（对话框/向导文案，来自 zh_data.json，均位于 dist/ 下） ----
+    for rel, patches in data.get("staticPatches", {}).items():
+        rel_norm = rel.replace("/", os.sep)
+        if not rel_norm.startswith("dist" + os.sep):
+            rel_norm = os.path.join("dist", rel_norm)
+        p = os.path.join(extract_dir, rel_norm)
+        if not os.path.isfile(p):
+            report.append(("跳过", f"{rel}（当前版本无此文件）", True))
+            continue
+        c = rd(p)
+        changed = False
+        for patch in patches:
+            new = apply_anchor_replace(c, patch["find"], patch["replace"], f"{rel}: {patch['find'][:30]}", report)
+            changed = changed or new != c
+            c = new
+        if changed:
+            wr(p, c)
+
+    # ---- 6. dist/updater.js：更新菜单项译文兼容 ----
+    # updateMenuState() 里 `item.label = step` 会把译文覆盖回英文；
+    # 同时该 label 又被 updateActions 当键用。这里保留英文原值到 __agyZhOrigLabel，
+    # 显示层用译文，查表仍用英文原值。
+    p = os.path.join(extract_dir, "dist", "updater.js")
+    if os.path.isfile(p):
+        c = rd(p)
+        find_orig = ("            item.label = step;\n"
+                     "            item.enabled = exports.updateActions[step] !== undefined;")
+        step_map = {k: v for k, v in data.get("menuMap", {}).items()
+                    if k in ("Check for Updates", "Checking for Updates...",
+                             "Downloading Update...", "Restart to Update")}
+        find_hooked = ("            item.__agyZhOrigLabel = step;\n"
+                       f"            item.label = {json.dumps(step_map, ensure_ascii=False)}[step] || step;\n"
+                       "            item.enabled = exports.updateActions[step] !== undefined;")
+        if find_orig in c:
+            c = c.replace(find_orig, find_hooked)
+            wr(p, c)
+            report.append(("替换", "updater.js 更新菜单项译文兼容", True))
+        elif find_hooked in c:
+            report.append(("已生效", "updater.js 更新菜单项译文兼容", True))
+        else:
+            report.append(("未命中", "updater.js 更新菜单项译文兼容（官方结构变动）", False))
+
+    return modified
+
+
+# ----------------------------------------------------------------------------
+# Antigravity IDE（独立 VS Code 宿主）右侧 agy 面板汉化
+# ----------------------------------------------------------------------------
+def find_ide_out(resources=None):
+    """定位 Antigravity IDE 的 resources/app/out 目录（找不到返回 None）"""
+    cands = []
+    if resources:
+        app_root = os.path.dirname(os.path.normpath(resources))
+        parent = os.path.dirname(app_root)
+        cands.extend([
+            os.path.join(parent, "Antigravity IDE", "resources", "app", "out"),
+            os.path.join(parent, "antigravity-ide", "resources", "app", "out"),
+        ])
+    if IS_WIN:
+        cands.extend([
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Antigravity IDE", "resources", "app", "out") if os.environ.get("LOCALAPPDATA") else "",
+            os.path.join(os.environ.get("ProgramFiles", ""), "Antigravity IDE", "resources", "app", "out") if os.environ.get("ProgramFiles") else "",
+            os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Antigravity IDE", "resources", "app", "out") if os.environ.get("ProgramFiles(x86)") else "",
+        ])
+    elif IS_MAC:
+        cands.extend([
+            "/Applications/Antigravity IDE.app/Contents/Resources/app/out",
+            os.path.expanduser("~/Applications/Antigravity IDE.app/Contents/Resources/app/out"),
+        ])
+    elif IS_LINUX:
+        cands.extend([
+            "/opt/antigravity-ide/resources/app/out",
+            "/opt/Antigravity IDE/resources/app/out",
+            "/usr/lib/antigravity-ide/resources/app/out",
+            "/usr/share/antigravity-ide/resources/app/out",
+            "/usr/lib/antigravity/ide/resources/app/out",
+            os.path.expanduser("~/.local/share/antigravity-ide/resources/app/out"),
+            os.path.expanduser("~/.local/share/Antigravity IDE/resources/app/out"),
+            os.path.expanduser("~/.local/opt/antigravity-ide/resources/app/out"),
+        ])
+    seen = set()
+    for c in cands:
+        if not c:
+            continue
+        norm = os.path.normpath(c)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        if os.path.isfile(os.path.join(norm, "main.js")):
+            return norm
+    return None
+
+
+def ide_is_localized(ide_out):
+    if not ide_out:
+        return False
+    main_js = os.path.join(ide_out, "main.js")
+    hook_js = os.path.join(ide_out, IDE_HOOK_NAME)
+    if not os.path.isfile(main_js) or not os.path.isfile(hook_js):
+        return False
+    try:
+        with open(main_js, encoding="utf-8", errors="ignore") as f:
+            return IDE_START in f.read()
+    except OSError:
+        return False
+
+
+def patch_ide_out(ide_out, engine_code, data, report):
+    """向 Antigravity IDE 的 out/main.js 注入右侧 agy 面板汉化钩子"""
+    if not ide_out:
+        return False
+    main_js = os.path.join(ide_out, "main.js")
+    hook_js = os.path.join(ide_out, IDE_HOOK_NAME)
+    if not os.path.isfile(main_js):
+        return False
+
+    data_json = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    engine_final = engine_code.replace("/*__AGY_ZH_DATA__*/ {}", "__AGY_ZH_DATA__JSON__").replace(
+        "__AGY_ZH_DATA__JSON__", data_json
+    )
+    hook_src = (
+        "// Antigravity IDE 右侧 agy 面板汉化注入钩子（由 Antigravity 一键汉化生成）\n"
+        "import electron from 'electron';\n"
+        "const { app, webFrameMain } = electron;\n"
+        f"const ENGINE_SCRIPT = {json.dumps(engine_final, ensure_ascii=False)};\n"
+        "function shouldInjectFrame(url) {\n"
+        "  if (!url) return false;\n"
+        "  if (/^https?:\\/\\/(127\\.0\\.0\\.1|localhost)(:\\d+)?\\//i.test(url)) return true;\n"
+        "  if (url.indexOf('workbench-jetski-agent.html') !== -1 || url.indexOf('jetskiAgent') !== -1) return true;\n"
+        "  if (url.indexOf('vscode-webview://') === 0) return true;\n"
+        "  return false;\n"
+        "}\n"
+        "function injectIntoFrame(pid, rid) {\n"
+        "  try {\n"
+        "    const frame = webFrameMain.fromId(pid, rid);\n"
+        "    if (!frame) return;\n"
+        "    if (!shouldInjectFrame(frame.url || '')) return;\n"
+        "    frame.executeJavaScript(ENGINE_SCRIPT).catch(() => {});\n"
+        "  } catch (_) {}\n"
+        "}\n"
+        "if (app && webFrameMain) {\n"
+        "  app.on('web-contents-created', (_ev, wc) => {\n"
+        "    try {\n"
+        "      wc.on('did-frame-finish-load', (_e, _isMain, pid, rid) => {\n"
+        "        injectIntoFrame(pid, rid);\n"
+        "      });\n"
+        "    } catch (_) {}\n"
+        "  });\n"
+        "}\n"
+    )
+    old_hook_js = os.path.join(ide_out, "agy-zh-ide.js")
+    if os.path.isfile(old_hook_js):
+        try:
+            os.remove(old_hook_js)
+        except OSError:
+            pass
+    with open(hook_js, "w", encoding="utf-8", newline="") as f:
+        f.write(hook_src)
+
+    bad = node_check([hook_js])
+    if bad:
+        try:
+            os.remove(hook_js)
+        except OSError:
+            pass
+        report.append(("失败", f"Antigravity IDE 钩子语法校验失败：{bad[0][1][:120]}", False))
+        return False
+
+    with open(main_js, encoding="utf-8") as f:
+        c = f.read()
+    c = strip_block(c, IDE_START, IDE_END)
+    block = (
+        f"\n{IDE_START}\n"
+        f'import("./{IDE_HOOK_NAME}").catch(() => {{}});\n'
+        f"{IDE_END}\n"
+    )
+    marker = "//# sourceMappingURL="
+    idx = c.rfind(marker)
+    if idx != -1:
+        c = c[:idx] + block + c[idx:]
+    else:
+        c = c.rstrip("\n") + block
+    with open(main_js, "w", encoding="utf-8", newline="") as f:
+        f.write(c)
+
+    bad_main = node_check([main_js])
+    if bad_main:
+        c_clean = strip_block(c, IDE_START, IDE_END)
+        with open(main_js, "w", encoding="utf-8", newline="") as f:
+            f.write(c_clean)
+        report.append(("失败", f"Antigravity IDE main.js 语法校验失败：{bad_main[0][1][:120]}", False))
+        return False
+
+    report.append(("注入", "Antigravity IDE 右侧 agy 面板翻译", True))
+    return True
+
+
+def restore_ide_out(ide_out):
+    """移除 Antigravity IDE 的汉化钩子"""
+    if not ide_out:
+        return False
+    changed = False
+    main_js = os.path.join(ide_out, "main.js")
+    hook_js = os.path.join(ide_out, IDE_HOOK_NAME)
+    if os.path.isfile(main_js):
+        with open(main_js, encoding="utf-8") as f:
+            c = f.read()
+        c_clean = strip_block(c, IDE_START, IDE_END)
+        if c_clean != c:
+            with open(main_js, "w", encoding="utf-8", newline="") as f:
+                f.write(c_clean)
+            changed = True
+    if os.path.isfile(hook_js):
+        try:
+            os.remove(hook_js)
+            changed = True
+        except OSError:
+            pass
+    return changed
+
+
+# ----------------------------------------------------------------------------
+# 备份策略（修复业界通病：官方更新后还原即降级）
+# ----------------------------------------------------------------------------
+def asar_is_localized(asar_path):
+    """字节级检测 asar 是否包含汉化注入标记"""
+    try:
+        with open(asar_path, "rb") as f:
+            chunk_size = 8 * 1024 * 1024
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    return False
+                if MARKER_CHECK in chunk:
+                    return True
+    except OSError:
+        return False
+
+
+def read_asar_header(asar_path):
+    """读取 asar 头部 JSON 目录树（Pickle 头：4+4+4+4 字节后是 JSON）"""
+    import struct
+    with open(asar_path, "rb") as f:
+        magic, size, _u, hs = struct.unpack("<4I", f.read(16))
+        if magic != 4:
+            raise ValueError("非标准 asar 头")
+        return json.loads(f.read(hs).decode("utf-8"))
+
+
+def get_unpacked_set(asar_path):
+    """返回 asar 中标记为 unpacked 的全部文件路径集合"""
+    header = read_asar_header(asar_path)
+    out = set()
+
+    def walk(node, prefix):
+        for name, info in node.get("files", {}).items():
+            p = f"{prefix}/{name}" if prefix else name
+            if "files" in info:
+                walk(info, p)
+            elif info.get("unpacked"):
+                out.add(p)
+
+    walk(header, "")
+    return out
+
+
+def derive_unpack_pattern(asar_path):
+    """从官方 asar 自动推导 --unpack-dir 模式（花括号组合），
+    取代硬编码的 chrome-devtools-mcp——未来官方往 unpacked 加新内容也能自动适配"""
+    entries = get_unpacked_set(asar_path)
+    if not entries:
+        return None, entries
+    dirs = set()
+    for p in entries:
+        parts = p.split("/")
+        # 取两级目录（node_modules/<包名> 粒度）；根级文件单独处理
+        dirs.add("/".join(parts[:2]) if len(parts) >= 2 else parts[0])
+    # 花括号组合成单条 glob（@electron/asar 的 minimatch 支持花括号展开）
+    items = sorted(dirs)
+    if len(items) == 1:
+        return items[0], entries
+    return "{" + ",".join(items) + "}", entries
+
+
+def ensure_backup(asar_path):
+    """当前 asar 为官方英文时（重新）生成备份；已汉化时不动备份。
+    这样官方更新后再次汉化，备份会自动刷新为新版英文，还原永不降级。"""
+    bak = asar_path + ".bak"
+    if asar_is_localized(asar_path):
+        if os.path.isfile(bak):
+            return bak, False
+        return None, False  # 已汉化但无备份（异常态，调用方负责警告）
+    # 当前是官方英文 → 刷新备份
+    tmp = bak + ".tmp"
+    shutil.copy2(asar_path, tmp)
+    os.replace(tmp, bak)
+    return bak, True
+
+
+def get_asar_version(extract_dir):
+    try:
+        pkg = json.load(open(os.path.join(extract_dir, "package.json"), encoding='utf-8'))
+        return pkg.get("version", "?")
+    except Exception:
+        return "?"
+
+
+# ----------------------------------------------------------------------------
+# 主管线
+# ----------------------------------------------------------------------------
+def cmd_apply(resources, npx, auto_yes=False):
+    asar = os.path.join(resources, "app.asar")
+    if not os.path.isfile(asar):
+        die(f"未找到 {asar}")
+
+    print("=" * 62)
+    print(f"  Antigravity 一键汉化 {TOOL_VERSION}（Windows / macOS 双平台）")
+    print("=" * 62)
+    log(f"目标：{asar}")
+
+    # 0. 引擎与词典自检
+    if not os.path.isfile(ENGINE_PATH):
+        die(f"缺少引擎文件：{ENGINE_PATH}")
+    if not os.path.isfile(DATA_PATH):
+        die(f"缺少词典文件：{DATA_PATH}")
+    engine_code = open(ENGINE_PATH, encoding='utf-8').read()
+    data = json.load(open(DATA_PATH, encoding='utf-8'))
+    log(f"词典装载：主词典 {len(data.get('exact', {}))} 条 / 正则 {len(data.get('regex', []))} 条 "
+        f"/ 菜单 {len(data.get('menuMap', {}))} 条", ok=True)
+
+    # 1. 备份（防降级策略）
+    bak, refreshed = ensure_backup(asar)
+    if bak:
+        log(f"官方原版备份：{bak}" + ("（已刷新为当前官方版本）" if refreshed else ""), ok=True)
+    else:
+        log("警告：当前 asar 已是汉化状态且找不到原版备份。", warn=True)
+        log("仍可继续（注入是幂等的），但将无法一键还原英文。", warn=True)
+        if not auto_yes:
+            if input("    是否继续？(y/N)：").strip().lower() not in ("y", "yes"):
+                die("已取消。", log=False)
+
+    # 2. 关闭进程（按路径过滤，只杀 Antigravity 自己的）
+    kill_processes(auto=auto_yes, resources_dir=resources)
+
+    # 3. 解包
+    work = tempfile.mkdtemp(prefix="agy_zh_")
+    # 用 atexit 兜底：即使用户 Ctrl+C 强杀，进程退出时也会清理工作目录，
+    # 避免在系统临时目录里留下几十 MB 的残留
+    import atexit
+    _work_ref = [work]
+
+    def _cleanup_work():
+        w = _work_ref[0]
+        if w and os.path.isdir(w):
+            shutil.rmtree(w, ignore_errors=True)
+
+    atexit.register(_cleanup_work)
+    extract_dir = os.path.join(work, "x")
+    log("正在解包 app.asar ...")
+    extract_any(npx, asar, extract_dir)
+    ver = get_asar_version(extract_dir)
+    log(f"检测到 Antigravity 版本：v{ver}", ok=True)
+    # 身份守卫：确认这是 Antigravity 的程序包（防止 --path 指错目录误伤其他软件）
+    try:
+        pkg = json.load(open(os.path.join(extract_dir, "package.json"), encoding='utf-8'))
+        pkg_name = (pkg.get("name") or pkg.get("productName") or "").strip().lower()
+    except Exception:
+        pkg_name = ""
+    if pkg_name != "antigravity":
+        die(f"目标程序包的身份是「{pkg_name or '未知'}」，不是 Antigravity。\n"
+            "  为避免影响其他软件，已中止。请检查安装路径是否指向 Antigravity。")
+    if ver != TESTED_VERSION:
+        log(f"注意：深度适配版本为 v{TESTED_VERSION}，当前为 v{ver}。", warn=True)
+        log("锚点替换均带容错（未命中只跳过不报错），一般可正常使用。", warn=True)
+
+    # 4. 注入
+    report = []
+    modified = patch_all(extract_dir, engine_code, data, report)
+    log(f"注入完成，共修改 {len(modified)} 个文件", ok=True)
+
+    # 5. 语法门禁（node --check，全部通过才继续）
+    bad = node_check(modified)
+    if bad:
+        for f, err in bad:
+            print(_fit_glyphs(f"[✗] 语法校验失败：{os.path.basename(f)}\n{err}"))
+        cleanup_temp(resources, work)
+        die("语法门禁未通过，已中止（原 app.asar 未被修改，软件不受影响）。")
+    log(f"语法门禁：{len(modified)} 个文件全部通过 node --check", ok=True)
+
+    # 6. 打包（排除目录自动从 asar 推导，未来版本新增 unpacked 内容也能适配；
+    #    临时文件名带 PID：即使极端情况下并发执行也不会互相覆盖）
+    temp_asar = os.path.join(resources, f"app.asar.agyzh.{os.getpid()}.tmp")
+    # 结构参照：优先用干净的官方备份（当前部署包本身可能带历史布局偏差）
+    bak = asar + ".bak"
+    ref_asar = bak if (os.path.isfile(bak) and not asar_is_localized(bak)) else asar
+    try:
+        official_unpacked = get_unpacked_set(ref_asar)
+    except Exception as e:
+        # 备份文件损坏（磁盘错误、被半截写入）时会解析失败。直接抛就是 Python 栈，
+        # 用户完全看不懂。退一步用当前包当参照：结构守卫照样生效，只是参照对象换了。
+        log(f"参照包头部解析失败（{e}），改用当前包作为结构参照", warn=True)
+        ref_asar = asar
+        official_unpacked = get_unpacked_set(ref_asar)
+    # 参照包里「索引声明为 unpacked、但外部文件实际不存在」的条目，本来就读不到，
+    # 不能算成打包遗漏——否则 2.28.1 那种官方漏文件会让结构守卫误报中止。
+    #
+    # 两个坑（都实测踩过，别改回去）：
+    # 1) 外部文件统一放在**当前** asar 的 .unpacked 目录里，`.bak` 没有配套的
+    #    `app.asar.bak.unpacked`。所以判断实际存在性必须用 asar + ".unpacked"，
+    #    不能拿 ref_asar 拼路径，否则会全部判为"缺失"、把守卫变成空壳。
+    # 2) 不能只依赖 skipped_unpacked：从「已汉化 asar」出发时，包本身不含坏条目，
+    #    官方工具能正常解包，skipped_unpacked 为空，但参照包（.bak 官方原版）里
+    #    仍然有那条缺失项 → 守卫误报。必须独立按实际文件存在性判定。
+    _udir = asar + ".unpacked"
+    if official_unpacked and os.path.isdir(_udir):
+        absent = {p for p in official_unpacked
+                  if not os.path.isfile(os.path.join(_udir, p.replace('/', os.sep)))}
+        if absent:
+            official_unpacked -= absent
+            log(f"参照包有 {len(absent)} 个外部文件实际不存在（官方包自身问题），已从结构守卫排除", warn=True)
+    # 内置打包器按"目录前缀"判定外部化，与官方 --unpack-dir 的 startsWith 语义一致。
+    # 不用 derive_unpack_pattern 的花括号 glob：那个写法只在单目录时有效，
+    # 多目录时 startsWith("{a,b}") 永远不成立，会把外部文件全塞回包内。
+    # 这里保留 original 集合（未剔除缺失项）来推导前缀——前缀是目录级的，
+    # 与单个文件在不在无关。
+    unpack_pattern, all_unpacked_entries = derive_unpack_pattern(ref_asar)
+    unpack_prefixes = []
+    for _p in sorted(all_unpacked_entries):
+        _parts = _p.split("/")
+        _pref = "/".join(_parts[:2]) if len(_parts) >= 2 else _parts[0]
+        if _pref not in unpack_prefixes:
+            unpack_prefixes.append(_pref)
+    log("正在重新打包 app.asar ..."
+        + (f"（外部目录模式：{unpack_pattern}）" if unpack_pattern else "（无外部目录）"))
+    try:
+        pack_any(npx, extract_dir, temp_asar, unpack_pattern, unpack_prefixes,
+                 force_builtin=len(unpack_prefixes) > 1)
+    except AsarToolError as e:
+        cleanup_temp(resources, work)
+        die(f"打包失败，已中止（原 app.asar 未被修改）。\n  {e}")
+    if not os.path.isfile(temp_asar):
+        cleanup_temp(resources, work)
+        die("打包产物缺失，已中止。")
+
+    # 6b. 结构守卫：新包必须包含参照清单的全部外部文件（缺文件=运行风险，零容忍）；
+    #     多出的项视为向官方结构靠拢的修正，放行并提示
+    try:
+        new_unpacked = get_unpacked_set(temp_asar)
+    except Exception as e:
+        cleanup_temp(resources, work)
+        die(f"打包产物头部解析失败（{e}），已中止。原文件未被修改。")
+    missing = official_unpacked - new_unpacked
+    if missing:
+        cleanup_temp(resources, work)
+        die("打包产物缺少官方外部文件，已中止（原文件未被修改）。\n"
+            f"  缺失 {len(missing)} 项，示例：{sorted(missing)[:3]}\n"
+            "  这通常意味着打包结构发生变化，请把此信息反馈给维护者。")
+    extra = new_unpacked - official_unpacked
+    if extra:
+        log(f"外部文件清单修正 {len(extra)} 项（向官方结构对齐，更安全）", ok=True)
+
+    # 7. 部署后复检：解包临时产物，验证标记与语法
+    verify_dir = os.path.join(work, "v")
+    extract_any(npx, temp_asar, verify_dir, quiet=True)
+    marker_checks = [
+        (os.path.join(verify_dir, "dist", "preload.js"), ENGINE_START),
+        (os.path.join(verify_dir, "dist", "menu.js"), MENU_START),
+        (os.path.join(verify_dir, "dist", "tray.js"), TRAY_START),
+    ]
+    missing = [p for p, mk in marker_checks
+               if not os.path.isfile(p) or mk not in open(p, encoding='utf-8', errors='replace').read()]
+    if missing:
+        cleanup_temp(resources, work)
+        die(f"部署后复检失败（标记缺失：{missing}），已中止。原文件未被修改。")
+    bad = node_check([p for p, _ in marker_checks])
+    if bad:
+        cleanup_temp(resources, work)
+        die("打包产物语法校验失败，已中止。原文件未被修改。")
+    log("部署后复检：注入标记与语法全部验证通过", ok=True)
+
+    # 8. 原子替换（同卷 os.replace）
+    #先做磁盘空间预检：备份 + 新包会同时存在，空间不足会中途失败留下垃圾
+    try:
+        need = os.path.getsize(temp_asar) + os.path.getsize(asar)
+        free = shutil.disk_usage(resources).free
+        if free < need + 50 * 1024 * 1024:
+            cleanup_temp(resources, work)
+            die(f"磁盘空间不足：本次汉化约需 {need // 1048576} MB 可用空间，"
+                f"当前仅剩 {free // 1048576} MB。\n"
+                "  请清理磁盘空间后重试。")
+    except AttributeError:
+        pass          # 极老的Python 没有 disk_usage，跳过检查
+    except OSError:
+        pass
+
+    replaced = False
+    try:
+        os.replace(temp_asar, asar)
+        replaced = True
+    except PermissionError:
+        # macOS：/Applications 权限不足时用管理员密码重试
+        #（Windows 走到这里通常是文件被占用，重试无意义）
+        if IS_MAC:
+            log("权限不足，正在弹出系统密码框以完成替换...", warn=True)
+            if _mac_replace_with_admin(temp_asar, asar):
+                replaced = True
+            else:
+                cleanup_temp(resources, work)
+                die("替换 app.asar 时权限不足，且管理员授权未完成。\n"
+                    "  请在「系统设置 → 隐私与安全性」中允许本工具访问"
+                    "「应用程序」文件夹后重试。")
+        else:
+            cleanup_temp(resources, work)
+            die("替换 app.asar 时被拒绝（文件仍被占用）。"
+                "请完全退出 Antigravity（含托盘）后重试。")
+    if not replaced:
+        cleanup_temp(resources, work)
+        die("替换 app.asar 失败，已中止（原文件未被修改）。")
+    # unpacked 目录：内容与官方完全一致（我们只改 dist/），无需变动；
+    # 打包产生的临时 unpacked 目录清理掉
+    cleanup_temp(resources, work)
+    log("部署完成：app.asar 已替换（原版备份保留在同目录 app.asar.bak）", ok=True)
+
+    # 8b. macOS：重签（Windows 下自动跳过）
+    signed = mac_post_deploy(resources, auto_yes=auto_yes)
+    # 无论本次签名成功与否，都把「修复签名.command」刷新成当前版本。
+    # 旧版（v1.14 及更早）留下的脚本不会写入稳定身份，用户以后运行它
+    # 会把更新能力悄悄退回 cdhash 状态——必须覆盖掉。
+    fix = _mac_write_fix_script(resources) if IS_MAC else None
+    if IS_MAC and not signed:
+        print()
+        print("  [!] 汉化内容已成功写入，但代码签名重签未完成。")
+        print("      在此状态下 Antigravity 可能提示「应用已损坏」而无法打开。")
+        if fix:
+            print("      已为你生成修复脚本，双击运行即可（会弹窗索要 Mac 密码）：")
+            print(f"        {fix}")
+            print("      运行完成后重新双击 Antigravity 就能正常打开。")
+        else:
+            print("      自动修复脚本生成失败，请查看 mac/README.md 的「打不开怎么办」一节。")
+        if not auto_yes:
+            input("\n  按回车键返回菜单...")
+
+    # 8c. Antigravity IDE（独立 VS Code 宿主）右侧 agy 面板汉化
+    ide_out = find_ide_out(resources)
+    if ide_out:
+        try:
+            if patch_ide_out(ide_out, engine_code, data, report):
+                log(f"Antigravity IDE 已注入右侧面板汉化：{ide_out}", ok=True)
+            else:
+                log("Antigravity IDE 右侧面板汉化注入失败（不影响主程序）", warn=True)
+        except Exception as e:
+            report.append(("失败", f"Antigravity IDE 汉化异常：{e}", False))
+            log(f"Antigravity IDE 汉化异常（不影响主程序）：{e}", warn=True)
+
+    # 9. 结果报告
+    print("-" * 62)
+    for kind, label, ok_ in report:
+        mark = _fit_glyphs("✓") if ok_ else _fit_glyphs("△")
+        print(_fit_glyphs(f"  {mark} [{kind}] {label}"))
+    fails = [r for r in report if not r[2]]
+    if fails:
+        # 区分两类未命中，避免 macOS 用户把"平台本来就没有的弹窗"误当成故障
+        win_only = [r for r in fails
+                    if any(k in r[1] for k in ("WSL", "Windows", "windows filesystem"))]
+        real = [r for r in fails if r not in win_only]
+        if IS_MAC and win_only:
+            print(f"\n[·] {len(win_only)} 处为 Windows 专属弹窗（WSL 等），"
+                  "Mac 版本就没有这些界面，属正常现象")
+        if real:
+            print(f"[!] 有 {len(real)} 处锚点未命中（官方版本变动所致，"
+                  "对应位置保持英文，不影响其他功能）")
+        if not real and not (IS_MAC and win_only):
+            print("\n[!] 有锚点未命中，请查看上方明细")
+    print("-" * 62)
+
+    # 10. 启动
+    if not auto_yes:
+        if input("是否立即启动 Antigravity？(Y/n)：").strip().lower() in ("", "y", "yes"):
+            launch_app(resources)
+    print("\n汉化完成！如界面有少量英文（AI 思考过程、模型名等属于刻意保留），"
+          "可编辑 zh_data.json 增补词条后重新运行。")
+
+
+def cleanup_temp(resources, work):
+    # 清理本次 PID 的临时产物 + 任意历史残留（app.asar.agyzh.*.tmp）
+    try:
+        for name in os.listdir(resources):
+            # .tmp.part 是内置打包器的写入中间态：进程被强杀时会残留，
+            # 不认它就会在 resources 里留一个几十 MB 的垃圾文件。
+            if name.startswith("app.asar.agyzh.") and (
+                    name.endswith(".tmp") or name.endswith(".tmp.unpacked")
+                    or name.endswith(".tmp.part")):
+                p = os.path.join(resources, name)
+                if os.path.isfile(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+                elif os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+    except OSError:
+        pass
+    shutil.rmtree(work, ignore_errors=True)
+
+
+def cmd_restore(resources, auto_yes=False):
+    asar = os.path.join(resources, "app.asar")
+    bak = asar + ".bak"
+    print("=" * 62)
+    print("  恢复官方英文原版")
+    print("=" * 62)
+    if not os.path.isfile(bak):
+        if not asar_is_localized(asar):
+            log("当前已是官方原版，无需恢复。", ok=True)
+            return
+        die(f"未找到备份文件 {bak}，无法恢复。\n"
+            "（当前 asar 已汉化且无备份。可重装 Antigravity 恢复英文。）")
+    if asar_is_localized(bak):
+        die("备份文件本身已被汉化污染（非官方原版），拒绝执行恢复以免损坏。\n"
+            "请重装 Antigravity 获取官方原版。")
+    if asar_is_localized(asar):
+        kill_processes(auto=auto_yes, resources_dir=resources)
+    tmp = asar + ".restore.tmp"
+    shutil.copy2(bak, tmp)
+    os.replace(tmp, asar)
+    log("已恢复官方英文原版", ok=True)
+
+    ide_out = find_ide_out(resources)
+    if ide_out and restore_ide_out(ide_out):
+        log(f"已移除 Antigravity IDE 右侧面板汉化：{ide_out}", ok=True)
+
+    # macOS：还原 asar 同样破坏了签名，必须重签，否则还原后反而打不开
+    if IS_MAC:
+        if _codesign_available():
+            mac_post_deploy(resources, auto_yes=auto_yes)
+            # 与汉化流程一致：顺手把修复脚本刷新到当前版本，
+            # 避免旧版脚本残留（它不会写稳定身份）
+            _mac_write_fix_script(resources)
+        else:
+            log("未找到 codesign，无法自动重签（还原后软件可能提示「已损坏」）", warn=True)
+            log("  解决：安装 Xcode 命令行工具（xcode-select --install），"
+                "再运行一次本还原流程。", warn=True)
+
+    if not auto_yes:
+        if input("是否立即启动 Antigravity？(Y/n)：").strip().lower() in ("", "y", "yes"):
+            launch_app(resources)
+
+
+def cmd_status(resources):
+    asar = os.path.join(resources, "app.asar")
+    bak = asar + ".bak"
+    print("=" * 62)
+    print("  状态检查")
+    print("=" * 62)
+    log(f"安装目录：{resources}")
+    if not os.path.isfile(asar):
+        die("未找到 app.asar")
+    loc = asar_is_localized(asar)
+    log(f"当前状态：{'已汉化' if loc else '官方英文原版'}", ok=True)
+    if os.path.isfile(bak):
+        bak_loc = asar_is_localized(bak)
+        log(f"原版备份：存在（{'正常' if not bak_loc else '警告：已被污染'}）", ok=not bak_loc)
+    else:
+        log("原版备份：不存在" + ("（已汉化状态无备份，无法还原英文！）" if loc else ""), warn=loc)
+    try:
+        log(f"app.asar 大小：{os.path.getsize(asar) / 1048576:.2f} MB")
+    except OSError:
+        pass
+    # macOS 追加：签名健康度（这是 Mac 上最常见的故障点）
+    mac_status_extra(resources)
+    ide_out = find_ide_out(resources)
+    if ide_out:
+        ide_loc = ide_is_localized(ide_out)
+        log(f"Antigravity IDE 右侧面板：{'已汉化' if ide_loc else '未汉化'}（{ide_out}）", ok=ide_loc, warn=not ide_loc)
+
+
+RULE_NAME = "chinese-replies.md"
+RULE_BODY = """# 全局规则：始终使用简体中文回复
+
+- 无论用户使用什么语言提问，你的**最终回复**必须使用简体中文。
+- 思考过程（Thinking）与内部推理可以用英文，但展示给用户的正文、总结、
+  计划、步骤说明一律使用简体中文。
+- 代码、命令、文件路径、错误信息原文、专有名词（如 Gemini、MCP、Git）保持原文，
+  不强行翻译；代码注释遵循用户现有注释语言。
+- 与用户交流时语言自然简洁，不逐字直译。
+"""
+
+def rules_dir():
+    base = os.path.join(os.path.expanduser("~"), ".gemini", "config", "rules")
+    return base
+
+def cmd_chinese_output(auto_yes=False):
+    """写入/移除"AI 用中文回复"的全局规则（输出汉化的正解：让模型自己说中文）"""
+    rd = rules_dir()
+    path = os.path.join(rd, RULE_NAME)
+    print("=" * 62)
+    print("  AI 回复中文化（全局规则）")
+    print("=" * 62)
+    if os.path.isfile(path):
+        print(_fit_glyphs("[✓] 当前状态：已启用（规则文件存在）"))
+        print("-" * 62)
+        print(RULE_BODY)
+        ans = "y" if auto_yes else input("输入 1=保留并刷新 / 2=移除该规则 / 回车=取消：").strip()
+        if ans == "2":
+            os.remove(path)
+            log("已移除规则：AI 将恢复默认语言行为", ok=True)
+            return
+        if ans not in ("1", "y"):
+            print("已取消。")
+            return
+    else:
+        print("说明：界面汉化管不了 AI 生成的回复内容——正确的做法是加一条全局规则，")
+        print("让模型自己用中文回复（思考过程仍保留英文，不影响推理质量）。")
+        print("-" * 62)
+        print("将写入以下规则到：" + path)
+        print(RULE_BODY)
+        ans = "y" if auto_yes else input("是否写入？(Y/n)：").strip().lower()
+        if ans not in ("", "y", "yes"):
+            print("已取消。")
+            return
+    os.makedirs(rd, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding='utf-8') as f:
+        f.write(RULE_BODY)
+    os.replace(tmp, path)
+    log(f"规则已写入：{path}", ok=True)
+    print("提示：规则对新对话生效；已在进行的对话可能需要新开一轮才受影响。")
+
+
+# ----------------------------------------------------------------------------
+# 检查更新
+# ----------------------------------------------------------------------------
+# 设计边界（改这里前请先读）：
+#   1. 全程序唯一的联网入口。只有用户主动点「检查更新」才会发请求，
+#      汉化 / 还原 / 状态 / AI 中文化 全程零网络行为，这是本工具的核心承诺。
+#   2. 只读取 Release 元数据，不下载执行任何远端代码；
+#      下载也只落一个 zip 到桌面，绝不自动替换自身文件。
+#   3. 任何网络异常都必须静默降级成一句话，绝不能甩堆栈、绝不能卡住主流程。
+def _safe_text(s):
+    """远端文本可能带 emoji，GBK 终端直接打印会崩；这里按终端能力降级。"""
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        return s.encode(enc, "replace").decode(enc, "replace")
+    except (UnicodeEncodeError, LookupError, UnicodeDecodeError):
+        return "".join(ch if ord(ch) < 128 else "?" for ch in s)
+
+
+def _parse_ver(tag):
+    """'v1.9.2' / '1.10.0-rc1' -> (1, 9, 2)；解析不了返回 None。"""
+    s = (tag or "").strip().lstrip("vV")
+    if not s:
+        return None
+    out = []
+    for seg in s.split("."):
+        m = re.match(r"^\d+", seg)
+        if not m:
+            return None
+        out.append(int(m.group(0)))
+    return tuple(out) if out else None
+
+
+def _ver_cmp(a, b):
+    """逐位比数字段，位数不同补 0。必须这么比：字符串比会让 1.10 < 1.9。"""
+    n = max(len(a), len(b))
+    a = a + (0,) * (n - len(a))
+    b = b + (0,) * (n - len(b))
+    return (a > b) - (a < b)
+
+
+def _brief_err(e):
+    """把网络异常压成一句人话"""
+    if isinstance(e, urllib.error.HTTPError):
+        code = getattr(e, "code", "?")
+        if code == 403:
+            return "GitHub 接口限流了（同一网络一小时最多 60 次）"
+        return f"GitHub 返回 {code}"
+    if isinstance(e, urllib.error.URLError):
+        return f"连不上 GitHub（{e.reason}）"
+    low = str(e).lower()
+    if "timed out" in low or "timeout" in low:
+        return "连接超时"
+    return type(e).__name__
+
+
+def _http_get(url, timeout, binary=False):
+    """发一个 GET，不带任何本机信息（只有 UA，用于满足 GitHub 的接口要求）"""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": f"Antigravity-YiJianHanHua/{TOOL_VERSION}",
+        "Accept": "application/vnd.github+json",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    return raw if binary else json.loads(raw.decode("utf-8", "replace"))
+
+
+def _pick_zip(assets):
+    """按当前系统挑对应的 zip（包命名：...-windows-vX.Y.zip / ...-mac-vX.Y.zip）"""
+    key = "mac" if IS_MAC else "windows"
+    for a in assets or []:
+        name = (a.get("name") or "").lower()
+        if name.endswith(".zip") and key in name and a.get("browser_download_url"):
+            return a
+    return None
+
+
+def _pick_sums(assets):
+    for a in assets or []:
+        if (a.get("name") or "").strip().lower() == "sha256sums.txt" and a.get("browser_download_url"):
+            return a
+    return None
+
+
+def _desktop_dir():
+    """找桌面目录，找不到返回 None（调用方回退到脚本目录）"""
+    home = os.path.expanduser("~")
+    cands = [os.path.join(home, "Desktop")]
+    if IS_WIN:
+        cands.append(os.path.join(os.environ.get("USERPROFILE", home), "Desktop"))
+        cands.append(os.path.join(home, "OneDrive", "Desktop"))
+    for p in cands:
+        if os.path.isdir(p):
+            return p
+    return None
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for blk in iter(lambda: f.read(1 << 20), b""):
+            h.update(blk)
+    return h.hexdigest()
+
+
+def _discard(tmp):
+    try:
+        if os.path.isfile(tmp):
+            os.remove(tmp)
+    except OSError:
+        pass
+
+
+def _unique_path(path):
+    """目标已存在就自动改名，绝不静默覆盖用户已有的文件"""
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    for i in range(1, 100):
+        cand = f"{base}({i}){ext}"
+        if not os.path.exists(cand):
+            return cand
+    return path
+
+
+def _download_to(url, dest, expect_size=0):
+    """分块下载 + 进度显示；失败清掉半成品。返回 (ok, err)"""
+    tmp = dest + ".part"
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": f"Antigravity-YiJianHanHua/{TOOL_VERSION}",
+        })
+        got = 0
+        with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp, open(tmp, "wb") as f:
+            while True:
+                chunk = resp.read(DL_CHUNK)
+                if not chunk:
+                    break
+                f.write(chunk)
+                got += len(chunk)
+                if expect_size:
+                    pct = min(100, got * 100 // expect_size)
+                    print(f"\r  下载中 {pct}%（{got // 1024} KB / {expect_size // 1024} KB）   ",
+                          end="", flush=True)
+                else:
+                    print(f"\r  下载中 {got // 1024} KB   ", end="", flush=True)
+        print("", flush=True)
+        os.replace(tmp, dest)
+        return True, None
+    except KeyboardInterrupt:
+        # 用户中途按 Ctrl+C：必须清掉半成品，否则下次会留一个 .part 垃圾文件
+        print("", flush=True)
+        _discard(tmp)
+        return False, "已取消"
+    except Exception as e:
+        _discard(tmp)
+        return False, _brief_err(e)
+
+
+def cmd_check_update(auto_yes=False):
+    """检查 GitHub 上的最新版本；只提示 / 下载到桌面，绝不自动替换自身文件。"""
+    print("=" * 62)
+    print("  检查更新")
+    print("=" * 62)
+    print(f"  当前版本：{TOOL_VERSION}")
+    print(f"  正在查询 GitHub Release（最多等 {UPDATE_TIMEOUT} 秒）...")
+    try:
+        data = _http_get(UPDATE_API, UPDATE_TIMEOUT)
+    except Exception as e:
+        log(f"暂时没查到：{_brief_err(e)}", warn=True)
+        print("-" * 62)
+        print("  这不影响汉化功能。你也可以自己打开这里看最新版：")
+        print(f"  {UPDATE_PAGE}")
+        return
+
+    tag = _safe_text(data.get("tag_name") or "")
+    page = data.get("html_url") or UPDATE_PAGE
+    cur = _parse_ver(TOOL_VERSION)
+    new = _parse_ver(tag)
+    if cur is None or new is None:
+        log(f"版本号无法自动比较（本地 {TOOL_VERSION} / 远端 {tag or '空'}）", warn=True)
+        print(f"  发布页：{page}")
+        return
+    if _ver_cmp(new, cur) <= 0:
+        log(f"已是最新版本（{TOOL_VERSION}）", ok=True)
+        return
+
+    assets = data.get("assets") or []
+    zip_asset = _pick_zip(assets)
+    print("-" * 62)
+    log(f"发现新版本：{tag}（当前 {TOOL_VERSION}）", ok=True)
+    pub = (data.get("published_at") or "")[:10]
+    if pub:
+        print(f"  发布时间：{pub}")
+    if zip_asset:
+        print(f"  适用包：{_safe_text(zip_asset['name'])}"
+              f"（{(zip_asset.get('size') or 0) / 1048576:.2f} MB）")
+    print("-" * 62)
+
+    body = (data.get("body") or "").strip()
+    if body:
+        lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+        print("  更新说明（摘要）：")
+        for ln in lines[:12]:
+            t = _safe_text(ln)
+            print("    " + (t[:70] + "..." if len(t) > 70 else t))
+        if len(lines) > 12:
+            print(f"    ...（共 {len(lines)} 行，完整内容见发布页）")
+    print("-" * 62)
+    print("  本工具不会自动替换自己的文件 —— 下载后由你决定怎么换。")
+
+    if not zip_asset:
+        print("  没找到适用于当前系统的安装包，请到发布页手动选择：")
+        print(f"  {page}")
+        return
+
+    print("  [1] 下载到桌面（下载完你自己解压替换）")
+    print("  [2] 只要下载链接（自己用浏览器或下载工具下）")
+    print("  [0] 取消")
+    if auto_yes:
+        ans = "1"
+    else:
+        try:
+            ans = input("请选择：").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+    if ans == "0":
+        print("已取消。")
+        return
+    if ans == "2":
+        print(f"  下载链接：{zip_asset['browser_download_url']}")
+        print(f"  发布页：{page}")
+        return
+    if ans != "1":
+        print("  输入无效，已取消。")
+        return
+
+    dest_dir = _desktop_dir() or SCRIPT_DIR
+    dest = _unique_path(os.path.join(dest_dir, zip_asset["name"]))
+    if os.path.exists(os.path.join(dest_dir, zip_asset["name"])):
+        print("  桌面上已经有同名文件了，这次存成另一个名字，不会覆盖你原来的：")
+    print(f"  下载到：{dest}")
+    ok, err = _download_to(zip_asset["browser_download_url"], dest, zip_asset.get("size") or 0)
+    if not ok:
+        log(f"下载失败：{err}", warn=True)
+        print("  下不动的时候建议自己去浏览器下载：")
+        print(f"  {zip_asset['browser_download_url']}")
+        return
+    log("下载完成", ok=True)
+
+    digest = _sha256_file(dest)
+    print(f"  文件 SHA256：{digest}")
+    sums = _pick_sums(assets)
+    if sums:
+        try:
+            txt = _http_get(sums["browser_download_url"], UPDATE_TIMEOUT, binary=True)
+            expect = None
+            for ln in txt.decode("utf-8", "replace").splitlines():
+                parts = ln.split()
+                if len(parts) >= 2 and os.path.basename(parts[-1]) == zip_asset["name"]:
+                    expect = parts[0].strip().lower()
+                    break
+            if expect is None:
+                log("校验文件里没有本包的记录，跳过校验", warn=True)
+            elif expect == digest:
+                log("SHA256 校验通过", ok=True)
+            else:
+                log("SHA256 校验不通过！文件可能不完整或被掉包，请勿使用", warn=True)
+                print(f"  期望：{expect}")
+                print(f"  实际：{digest}")
+                return
+        except Exception as e:
+            log(f"校验文件下载失败（{_brief_err(e)}），跳过校验", warn=True)
+    else:
+        log("该 Release 未附带 SHA256SUMS.txt，跳过校验", warn=True)
+
+    print("-" * 62)
+    print(f"  已保存到：{dest}")
+    print("  下一步：先退出本程序，再解压这个 zip，把里面的文件覆盖到你现在的目录，")
+    print("  然后重新运行。正在运行时替换文件会让当前窗口读错，顺序别反。")
+
+
+# ----------------------------------------------------------------------------
+# 入口
+# ----------------------------------------------------------------------------
+def _say_goodbye():
+    """明确告诉用户这是正常结束，不是崩溃。
+
+    网友反馈里最常见的误判就是"按了个键，窗口就没了=闪退"。窗口确实会在按键后
+    关闭（Windows 的 pause 就是这么设计的），但必须让人看懂这是正常收尾。
+    bat 那边因为编码限制只能写英文，所以这句中文在这里补上。
+    """
+    print("\n  已退出。窗口会在你按任意键后关闭——这是正常结束，不是闪退。")
+    print("  想再操作一次，重新双击 一键汉化.bat 即可。")
+
+
+def menu_pause():
+    """操作结束后停一下让用户看结果；回车回主菜单，输入 0 直接退出本程序。
+
+    注意：这里以前只把输入丢掉、不判断内容，导致提示写着"输入 0 可退出"但输 0 照样
+    回主菜单，用户以为程序卡住了。现在真按提示执行。
+
+    另外，Ctrl+C / 输入流断开时**不能静默返回 0**：批处理看到 0 会当成"全部成功"
+    直接关窗，用户什么都没看清就闪退。这里统一用 130 表示"用户主动中断"，
+    由 .bat 单独识别并给出说明。
+    """
+    try:
+        ans = input("\n  按回车返回主菜单（输入 0 直接退出）...").strip()
+    except (EOFError, KeyboardInterrupt):
+        # 这里操作本身已经做完了，只是"回菜单"这一步被打断，说"已退出"即可，
+        # 不要吓唬成"中断"，免得用户以为刚才的汉化没成功。
+        print("\n  已退出。")
+        raise SystemExit(EXIT_CANCELLED)
+    if ans == "0":
+        _say_goodbye()
+        raise SystemExit(0)
+
+
+def main():
+    args = [a for a in sys.argv[1:]]
+    auto_yes = "--yes" in args or "/y" in args
+    args = [a for a in args if a not in ("--yes", "/y")]
+    path_override = None
+    if "--path" in args:
+        i = args.index("--path")
+        path_override = args[i + 1] if i + 1 < len(args) else None
+        args = [a for a in args if a != "--path" and a != path_override]
+
+    cmd = args[0] if args else ""
+
+    # 检查更新不依赖 Antigravity 是否安装：没装软件的人也要能查新版本
+    if cmd in ("update", "check-update", "u", "5"):
+        cmd_check_update(auto_yes)
+        return
+
+    resources = find_resources(path_override)
+
+    if cmd in ("apply", "a", "1"):
+        npx = check_env()
+        lock = acquire_lock()
+        try:
+            cmd_apply(resources, npx, auto_yes)
+        finally:
+            release_lock(lock)
+    elif cmd in ("restore", "r", "2"):
+        lock = acquire_lock()
+        try:
+            cmd_restore(resources, auto_yes)
+        finally:
+            release_lock(lock)
+    elif cmd in ("status", "s", "3"):
+        cmd_status(resources)
+    elif cmd in ("chinese-output", "chinese", "cn-output", "4"):
+        cmd_chinese_output(auto_yes)
+    elif cmd == "":
+        while True:
+            plat = "macOS" if IS_MAC else ("Windows" if IS_WIN else "Linux")
+            print("=" * 62)
+            print(f"  Antigravity 一键汉化 {TOOL_VERSION}（当前系统：{plat}）")
+            print("=" * 62)
+            print("  [1] 一键汉化（官方更新后重新运行即可）")
+            print("  [2] 恢复官方英文原版")
+            print("  [3] 查看状态")
+            print("  [4] AI 回复中文化（让 AI 用中文回答，可开可关）")
+            print("  [5] 检查更新（查 GitHub 上有没有新版本）")
+            print("  [0] 退出")
+            print("  （每个操作做完会回到本菜单，可以接着做下一件事）")
+            if IS_MAC:
+                print("  提示：Mac 上如提示「应用已损坏」，选3 查看状态里的签名项")
+            try:
+                c = input("请选择：").strip()
+            except (EOFError, KeyboardInterrupt):
+                # 不能直接 return：退出码 0 会让 .bat 判定"全部成功"立刻关窗，
+                # 用户看到的就是"随便按一下窗口就没了"。统一按中断处理。
+                print("\n  已中断（Ctrl+C 或输入已关闭）。软件没有被改动。")
+                raise SystemExit(EXIT_CANCELLED)
+            if c == "1":
+                npx = check_env()
+                lock = acquire_lock()
+                try:
+                    cmd_apply(resources, npx, auto_yes=False)
+                finally:
+                    release_lock(lock)
+                menu_pause()
+                continue
+            if c == "2":
+                lock = acquire_lock()
+                try:
+                    cmd_restore(resources)
+                finally:
+                    release_lock(lock)
+                menu_pause()
+                continue
+            if c == "3":
+                cmd_status(resources)
+                menu_pause()
+                continue
+            if c == "4":
+                cmd_chinese_output()
+                menu_pause()
+                continue
+            if c == "5":
+                cmd_check_update()
+                menu_pause()
+                continue
+            if c == "0":
+                _say_goodbye()
+                return
+            print("\n  输入无效，请重新选择（1 / 2 / 3 / 4 / 5 / 0）。")
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    # 统一兜底：用户在哪一步按 Ctrl+C、或出现没预料到的异常，
+    # 都不许把 Python traceback 甩到用户脸上（那是"闪退/坏了"观感的最大来源）。
+    # 一律翻译成一句人话 + 一份失败日志 + 明确的退出码。
+    try:
+        main()
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        print("\n  已中断（Ctrl+C 或输入已关闭）。软件没有被改动。")
+        sys.exit(EXIT_CANCELLED)
+    except Exception as e:
+        # 把最常见的 Windows 文件错误翻译成人话。技术细节仍然完整写进日志，
+        # 但屏幕上不能甩 "WinError 32" 这种术语——网友看不懂，只会觉得程序坏了。
+        winerr = getattr(e, "winerror", None)
+        human = None
+        if winerr == 32:
+            human = ("文件正被其他程序占用（最常见：Antigravity 没完全退出，或杀毒软件正在扫描）。\n"
+                     "  请彻底退出 Antigravity（包括右下角托盘图标）后重新运行本程序；\n"
+                     "  若装了杀毒软件，等十几秒再试一次。\n"
+                     "  本次没有改动你的 Antigravity，可以放心重试。")
+        elif winerr == 5:
+            human = ("没有权限修改 Antigravity 的安装目录。\n"
+                     "  请右键本程序 → 选择「以管理员身份运行」，然后重试。\n"
+                     "  本次没有改动你的 Antigravity，可以放心重试。")
+        msg = human or f"程序异常终止：{type(e).__name__}: {e}"
+        print(_fit_glyphs(f"[✗] {msg}"))
+        _write_fail_log(traceback.format_exc())
+        sys.exit(1)
